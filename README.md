@@ -9,12 +9,15 @@ A PyTorch project template with comprehensive code quality enforcement tools.
 
 This repository demonstrates best practices for maintaining high code quality in PyTorch projects. It includes:
 
+- **Conda Support**: Optimized dependency management for PyTorch with GPU/CPU options
 - **Code Formatting**: Black and isort for consistent code style
 - **Linting**: Flake8 and Pylint for catching code issues
 - **Type Checking**: MyPy for static type analysis
 - **Pre-commit Hooks**: Automated checks before each commit
 - **CI/CD**: GitHub Actions workflow for continuous integration
 - **Testing**: pytest with coverage reporting
+
+📖 **Quick Reference**: See [QUICKSTART.md](QUICKSTART.md) for common commands and workflows.
 
 ## Quick Start
 
