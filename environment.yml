@@ -11,7 +11,9 @@ dependencies:
   - pytorch>=2.0.0
   - torchvision>=0.15.0
   - torchaudio>=2.0.0
-  - pytorch-cuda=11.8  # Use pytorch-cuda=12.1 for CUDA 12.1, or cpuonly for CPU-only
+  # For CUDA 12.1, use: pytorch-cuda=12.1
+  # For CPU-only, use: cpuonly
+  - pytorch-cuda=11.8
   
   # Scientific computing
   - numpy>=1.21.0

@@ -2,11 +2,14 @@
 
 from setuptools import find_packages, setup
 
+with open("README.md", encoding="utf-8") as f:
+    long_description = f.read()
+
 setup(
     name="adaptive-muon",
     version="0.1.0",
     description="PyTorch project with enforced code quality",
-    long_description=open("README.md").read(),
+    long_description=long_description,
     long_description_content_type="text/markdown",
     author="Your Name",
     packages=find_packages(),
