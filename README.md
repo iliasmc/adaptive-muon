@@ -11,6 +11,9 @@ We want to investigate using an adaptive version of Muon, to preserve its benefi
 
 ## Quick Start
 
+### Training model
+`python -m src.train_model`
+
 ### Installation
 
 #### Option 1: Using Conda (Recommended)
