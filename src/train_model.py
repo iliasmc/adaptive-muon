@@ -7,12 +7,10 @@ The main file for running experiments. Taken from https://github.com/KellerJorda
 #############################################
 
 import os
-import sys
 
-with open(sys.argv[0]) as f:
-    code = f.read()
+# with open(sys.argv[0]) as f:
+#     code = f.read()
 import time
-import uuid
 from math import ceil
 
 import torch
@@ -21,7 +19,7 @@ import torchvision
 import torchvision.transforms as T
 from torch import nn
 
-from muon_original import Muon
+from .muon_original import Muon
 
 #############################################
 #             Select PyTorch device         #
@@ -170,7 +168,7 @@ class ConvGroup(nn.Module):
     def __init__(self, channels_in, channels_out):
         super().__init__()
         self.conv1 = Conv(channels_in, channels_out)
-        self.pool = nn.MaxPool2d(2)
+        self.pool = nn.MaxPool2d(2, return_indices=True)
         self.norm1 = BatchNorm(channels_out)
         self.conv2 = Conv(channels_out, channels_out)
         self.norm2 = BatchNorm(channels_out)
@@ -179,6 +177,8 @@ class ConvGroup(nn.Module):
     def forward(self, x):
         x = self.conv1(x)
         x = self.pool(x)
+        if isinstance(x, tuple):
+            x = x[0]
         x = self.norm1(x)
         x = self.activ(x)
         x = self.conv2(x)
@@ -200,7 +200,7 @@ class CifarNet(nn.Module):
             ConvGroup(whiten_width, widths["block1"]),
             ConvGroup(widths["block1"], widths["block2"]),
             ConvGroup(widths["block2"], widths["block3"]),
-            nn.MaxPool2d(3),
+            nn.MaxPool2d(3, return_indices=True),
         )
         self.head = nn.Linear(widths["block3"], 10, bias=False)
         for mod in self.modules():
@@ -237,6 +237,9 @@ class CifarNet(nn.Module):
         b = self.whiten.bias
         x = F.conv2d(x, self.whiten.weight, b if whiten_bias_grad else b.detach())
         x = self.layers(x)
+        # Unpack tuple if return_indices=True was used in MaxPool2d
+        if isinstance(x, tuple):
+            x = x[0]
         x = x.view(len(x), -1)
         return self.head(x) / x.size(-1)
 
@@ -418,6 +421,16 @@ def main(run, model):
         epoch_duration = epoch_end_time - epoch_start_time
         print(f"Epoch {epoch} completed in {epoch_duration:.4f} seconds")
 
+        # Store model weights
+        # Save model weights after each epoch into the model_weights/ directory
+        try:
+            os.makedirs("model_weights", exist_ok=True)
+            weight_path = os.path.join("model_weights", f"model_epoch_{epoch}.pt")
+            torch.save({"epoch": epoch, "state_dict": model.state_dict()}, weight_path)
+            print(f"Saved model weights to {os.path.abspath(weight_path)}")
+        except Exception as e:
+            print(f"Warning: failed to save model weights for epoch {epoch}: {e}")
+
         # stop_timer()
 
         ####################
@@ -450,7 +463,9 @@ def main(run, model):
 
 if __name__ == "__main__":
     # We re-use the compiled model between runs to save the non-data-dependent compilation time
-    model = CifarNet().to(memory_format=torch.channels_last).to(device)
+    # Move the model to the selected device. Inputs are already set to channels-last in the loader.
+    ### Training code ###
+    model = CifarNet().to(device)
     print(model)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params}")
@@ -465,12 +480,14 @@ if __name__ == "__main__":
     print("About to print columns")
 
     print_columns(logging_columns_list, is_head=True)
-    main("warmup", model)
-    accs = torch.tensor([main(run, model) for run in range(200)])
+    # main("warmup", model)
+    accs = torch.tensor([main(run, model) for run in range(1)])
     print("Mean: %.4f    Std: %.4f" % (accs.mean(), accs.std()))
 
-    log_dir = os.path.join("logs", str(uuid.uuid4()))
-    os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "log.pt")
-    torch.save(dict(code=code, accs=accs), log_path)
-    print(os.path.abspath(log_path))
+    # log_dir = os.path.join("logs", str(uuid.uuid4()))
+    # os.makedirs(log_dir, exist_ok=True)
+    # log_path = os.path.join(log_dir, "log.pt")
+    # torch.save(dict(code=code, accs=accs), log_path)
+    # print(os.path.abspath(log_path))
+
+    ### PyHessian Code ###
