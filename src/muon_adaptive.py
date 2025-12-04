@@ -5,7 +5,6 @@ The code for the adaptive muon.
 import torch
 
 
-@torch.compile
 def zeropower_via_newtonschulz5(G, steps=3, eps=1e-7):
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
@@ -40,12 +39,22 @@ class Muon(torch.optim.Optimizer):
         if nesterov and momentum <= 0:
             raise ValueError("Nesterov momentum requires a momentum")
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov)
+
+        self.current_step = 0
+        self.orth_every = 1
+        self.orthogonalization_count = 0
+        self.skipped_orthogonalization_count = 0
+
         super().__init__(params, defaults)
 
     def step(self):
+        self.current_step += 1
+
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
+            do_orth = (self.current_step % self.orth_every == 0)
+
             for p in group["params"]:
                 g = p.grad
                 if g is None:
@@ -59,7 +68,20 @@ class Muon(torch.optim.Optimizer):
                 g = g.add(buf, alpha=momentum) if group["nesterov"] else buf
 
                 p.data.mul_(len(p.data) ** 0.5 / p.data.norm())  # normalize the weight
-                update = zeropower_via_newtonschulz5(g.reshape(len(g), -1)).view(
-                    g.shape
-                )  # whiten the update
+
+                # Periodic orthogonalization
+                if do_orth or "buffer" not in state:
+                    if "buffer" not in state:
+                        state["buffer"] = torch.zeros_like(g)
+
+                    # compute new orthogonalized update from momentum m
+                    update = zeropower_via_newtonschulz5(g.reshape(len(g), -1)).view(
+                        g.shape
+                    )  # whiten the update
+                    state["buffer"].copy_(update)
+                    self.orthogonalization_count += 1
+                else:
+                    # reuse previous orthogonalized direction
+                    update = state["buffer"]
+                    self.skipped_orthogonalization_count += 1
                 p.data.add_(update, alpha=-lr)  # take a step

@@ -89,7 +89,7 @@ class CifarLoader:
         self.images, self.labels, self.classes = data["images"], data["labels"], data["classes"]
         # It's faster to load+process uint8 data than to load preprocessed fp16 data
         self.images = (
-            (self.images.float() / 255).permute(0, 3, 1, 2).to(memory_format=torch.channels_last)
+            (self.images.float() / 255).permute(0, 3, 1, 2)
         )
 
         self.normalize = T.Normalize(CIFAR_MEAN, CIFAR_STD)
@@ -333,6 +333,8 @@ def main(run, model):
     head_lr = 0.67
     wd = 2e-6 * batch_size
 
+    print(f"Starting run {run}...")
+
     test_loader = CifarLoader("cifar10", train=False, batch_size=2000)
     train_loader = CifarLoader(
         "cifar10", train=True, batch_size=batch_size, aug=dict(flip=True, translate=2)
@@ -387,8 +389,19 @@ def main(run, model):
     # model.init_whiten(train_images)
     # stop_timer()
 
+    num_epochs = ceil(total_train_steps / len(train_loader))
+
     for epoch in range(ceil(total_train_steps / len(train_loader))):
         print(f"At epoch: {epoch}")
+
+        frac = epoch / num_epochs
+        threshold = 0.4
+        if frac < threshold:
+            optimizer2.orth_every = 1
+        else:
+            optimizer2.orth_every = 2
+
+        print(f"Epoch {epoch}: orth_every = {optimizer2.orth_every}, threshold = {threshold}")
 
         # Start epoch timer
         epoch_start_time = time.time()
@@ -445,12 +458,12 @@ def main(run, model):
     total_training_time = total_end_time - total_start_time
     print(f"Total training time: {total_training_time:.4f} seconds")
 
-    return tta_val_acc
+    return tta_val_acc, total_training_time
 
 
 if __name__ == "__main__":
     # We re-use the compiled model between runs to save the non-data-dependent compilation time
-    model = CifarNet().to(memory_format=torch.channels_last).to(device)
+    model = CifarNet().to(device)
     print(model)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params}")
@@ -466,8 +479,19 @@ if __name__ == "__main__":
 
     print_columns(logging_columns_list, is_head=True)
     main("warmup", model)
-    accs = torch.tensor([main(run, model) for run in range(200)])
-    print("Mean: %.4f    Std: %.4f" % (accs.mean(), accs.std()))
+    accs = []
+    training_times = []
+
+    for run in range(3):
+        acc, training_time = main(run, model)
+        accs.append(acc)
+        training_times.append(training_time)
+
+    accs = torch.tensor(accs)
+    training_times = torch.tensor(training_times)
+
+    print("[Accuracy] Mean: %.4f    Std: %.4f" % (accs.mean(), accs.std()))
+    print("[Training Time] Mean: %.4f    Std: %.4f" % (training_times.mean(), training_times.std()))
 
     log_dir = os.path.join("logs", str(uuid.uuid4()))
     os.makedirs(log_dir, exist_ok=True)
