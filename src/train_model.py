@@ -21,7 +21,7 @@ import torchvision
 import torchvision.transforms as T
 from torch import nn
 
-from muon_original import Muon
+from muon_adaptive import Muon
 
 #############################################
 #             Select PyTorch device         #
