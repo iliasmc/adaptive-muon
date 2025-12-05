@@ -13,6 +13,7 @@ import os
 import time
 from math import ceil
 
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 import torchvision
@@ -190,7 +191,8 @@ class ConvGroup(nn.Module):
 class CifarNet(nn.Module):
     def __init__(self):
         super().__init__()
-        widths = dict(block1=64, block2=256, block3=256)
+        # widths = dict(block1=64, block2=256, block3=256)
+        widths = dict(block1=32, block2=64, block3=64)
         whiten_kernel_size = 2
         whiten_width = 2 * 3 * whiten_kernel_size**2
         self.whiten = nn.Conv2d(3, whiten_width, whiten_kernel_size, padding=0, bias=True)
@@ -340,13 +342,14 @@ def main(run, model):
     train_loader = CifarLoader(
         "cifar10", train=True, batch_size=batch_size, aug=dict(flip=True, translate=2)
     )
+    num_epochs = 8
 
     if run == "warmup":
         # The only purpose of the first run is to warmup the compiled model, so we can use dummy data
         train_loader.labels = torch.randint(
             0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device
         )
-    total_train_steps = ceil(8 * len(train_loader))
+    total_train_steps = ceil(num_epochs * len(train_loader))
     whiten_bias_train_steps = ceil(3 * len(train_loader))
 
     # Start total training timer
@@ -383,6 +386,7 @@ def main(run, model):
 
     model.reset()
     step = 0
+    val_accs = []  # Track validation accuracies for plotting
 
     # Initialize the whitening layer using training images
     # start_timer()
@@ -439,7 +443,21 @@ def main(run, model):
 
         # Save the accuracy and loss from the last training batch of the epoch
         # train_acc = (outputs.detach().argmax(1) == labels).float().mean().item()
-        # val_acc = evaluate(model, test_loader, tta_level=0)
+        model.eval()
+        val_acc = evaluate(model, test_loader, tta_level=0)
+        val_accs.append(val_acc)
+        # print(f"Epoch {epoch} - Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}")
+        
+    # Save validation accuracy plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(len(val_accs)), val_accs, marker='o', linestyle='-', color='blue')
+    plt.xlabel('Epoch')
+    plt.ylabel('Validation Accuracy')
+    plt.title('Validation Accuracy over Training')
+    plt.grid(True)
+    plt.savefig('val_accuracy_plot.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved validation accuracy plot to val_accuracy_plot.png")
         # print_training_details(locals(), is_final_entry=False)
         # run = None # Only print the run number once
 
