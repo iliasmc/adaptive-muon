@@ -43,8 +43,11 @@ class Muon(torch.optim.Optimizer):
 
         self.current_step = 0
         self.prob_orth = 1.0
-        self.decay_rate = 0.01
-        self.scheduler = "exponential"
+        self.decay_rate = 0.004
+        self.step_size = 25
+        self.scheduler = "cosine_annealing"
+        self.pr_min = 0
+        self.pr_max = 0.8
         self.orthogonalization_count = 0
         self.skipped_orthogonalization_count = 0
 
@@ -57,8 +60,24 @@ class Muon(torch.optim.Optimizer):
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
-            prob_orth = self.prob_orth* np.exp(-self.decay_rate * self.current_step)
-            do_orth = bool(np.random.binomial(1, prob_orth))
+            if self.scheduler == "exponential":
+                # best combination for now decay_rate = 0.0038 and prob_orth = 1.0
+                prob_orth = self.prob_orth* np.exp(-self.decay_rate * self.current_step)
+                do_orth = bool(np.random.binomial(1, prob_orth))
+            elif self.scheduler == "step_decay":
+                prob_orth = self.prob_orth * (self.decay_rate ** np.floor(self.current_step/self.step_size))
+                do_orth = bool(np.random.binomial(1, prob_orth))
+            elif self.scheduler == "cosine_annealing":
+                prob_orth = self.pr_min + 0.5 * (self.pr_max - self.pr_min) * (1 + np.cos(self.current_step/ 1200 * np.pi))
+                do_orth = bool(np.random.binomial(1, prob_orth))
+            elif self.scheduler == "cyclic":
+                cycle = np.floor( 1 + self.current_step/(2*self.stepsize))
+                x = abs(self.current_step/self.stepsize - 2*cycle + 1)
+                new_pr = self.pr_min + (self.pr_max - self.pr_min) * max(0, 1-x)
+                do_orth = bool(np.random.binomial(1, new_pr))
+            else:
+                print(f"The picked scheduler: {self.scheduler} has not been implemented!")
+                return 
 
             for p in group["params"]:
                 g = p.grad
@@ -88,5 +107,6 @@ class Muon(torch.optim.Optimizer):
                 else:
                     # reuse previous orthogonalized direction
                     update = state["buffer"]
+                    # update = g
                     self.skipped_orthogonalization_count += 1
                 p.data.add_(update, alpha=-lr)  # take a step

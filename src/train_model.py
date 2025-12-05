@@ -19,7 +19,7 @@ import torchvision
 import torchvision.transforms as T
 from torch import nn
 
-from .muon_original import Muon
+from muon_probabilistic import Muon
 
 #############################################
 #             Select PyTorch device         #
@@ -336,9 +336,9 @@ def main(run, model):
     head_lr = 0.67
     wd = 2e-6 * batch_size
 
-    test_loader = CifarLoader("cifar10", train=False, batch_size=2000)
+    test_loader = CifarLoader("/work/scratch/amihalkova", train=False, batch_size=2000)
     train_loader = CifarLoader(
-        "cifar10", train=True, batch_size=batch_size, aug=dict(flip=True, translate=2)
+        "/work/scratch/amihalkova", train=True, batch_size=batch_size, aug=dict(flip=True, translate=2)
     )
 
     if run == "warmup":
@@ -457,7 +457,8 @@ def main(run, model):
     total_end_time = time.time()
     total_training_time = total_end_time - total_start_time
     print(f"Total training time: {total_training_time:.4f} seconds")
-
+    print("Skipped steps:", optimizer2.skipped_orthogonalization_count)
+    print("Non-skipped steps:", optimizer2.orthogonalization_count)
     return tta_val_acc
 
 
