@@ -1,6 +1,7 @@
 # Manually added
 cifar10
 model_weights
+*.png
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
