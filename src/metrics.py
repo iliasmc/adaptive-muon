@@ -1,270 +1,220 @@
-"""
-https://medium.com/@ph_singer/handling-huge-matrices-in-python-dff4e31d4417
-https://github.com/EigenPro/EigenPro-pytorch
-https://github.com/touqir14/LUP-rank-computer
-https://www.cs.ubc.ca/~nickhar/W12/Lecture15Notes.pdf
-"""
-import itertools
+import gc
 import os
 import time
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from backpack import backpack, extend
-from backpack.extensions import DiagHessian
-from curvlinops import HessianLinearOperator, hutchinson_squared_fro
-from pyhessian import hessian
+from curvlinops import HessianLinearOperator, hutchinson_squared_fro, hutchinson_trace
 from scipy.sparse.linalg import eigsh
 
+# Assuming local imports
 from .train_model import CifarLoader, CifarNet
 
 
-def analyze_hessian_eigenvalues(model, batch, ev_num, device="cuda"):
+# ==========================================
+# HELPER: SAFETY CHECKS
+# ==========================================
+def check_model_integrity(model):
+    """Checks if model weights have exploded to NaN/Inf."""
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            print(f"   [WARNING] Model weights corrupted (NaN/Inf) at layer: {name}")
+            return False
+    return True
+
+
+def clear_memory(device):
+    gc.collect()
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    elif device == "mps":
+        try:
+            torch.mps.empty_cache()
+        except:
+            pass
+
+
+# ==========================================
+# CORE ANALYSIS
+# ==========================================
+def analyze_hessian_metrics(model, batch, num_eigenvalues=1, num_trace_vecs=100):
     """
-    Load a .pth file and compute Hessian eigenvalues
-
-    Args:
-        weight_path: Path to the .pth file
-        dataloader: DataLoader for your dataset
-        criterion: Loss function
-    Returns:
-        top_eigenvalues, trace, density
+    Computes metrics using Float64 on CPU for numerical stability.
     """
+    # 1. Setup: Force CPU and Double Precision (Float64)
+    #    Hessian analysis is extremely sensitive to precision.
+    device = "cpu"
+    model = model.to(device).double()  # Critical for stability
 
-    crit = torch.nn.CrossEntropyLoss()
+    # Unpack and cast batch to double
+    inputs, targets = batch
+    inputs = inputs.to(device).double()
+    targets = targets.to(device)
 
-    hessian_comp = hessian(model, crit, data=batch, cuda=(device=="cuda"))
-
-    # Compute top eigenvalues (e.g., top 10)
-    top_eigenvalues, top_eigenvector = hessian_comp.eigenvalues(top_n=ev_num)
-
-    # ev_list = []
-    print(f"Top {ev_num} Hessian eigenvalues:")
-    for i, eigenval in enumerate(top_eigenvalues):
-        print(f"Eigenvalue {i+1}: {eigenval:.6f}")
-
-    # Compute the trace (sum of all eigenvalues)
-    trace = hessian_comp.trace()
-    print(trace)
-    trace = np.mean(trace)
-    print(f"\nTrace of Hessian: {trace:.6f}")
-
-    # Compute density of eigenvalues
-    # hessian_density = hessian_comp.density()
-
-    return top_eigenvalues, trace, #hessian_density
-
-
-def analyze_hessian_stable_rank(
-    model, batch, num_matvecs=100, top_k=1, distribution="rademacher", device="cpu"
-):
-    """
-    Load a .pth file and compute Hessian stable rank using CurvLinOps
-
-    Args:
-        weight_path: Path to the .pth file
-        batch_size: Batch size for data loading
-        num_matvecs: Total number of matrix-vector products to use for Frobenius norm estimation.
-                    Must be smaller than the minimum dimension of the matrix.
-        top_k: Number of top eigenvalues to compute
-        distribution: Distribution of random vectors for trace estimation.
-                     Can be either 'rademacher' or 'normal'. Default: 'rademacher'
-    Returns:
-        tuple[stable_rank, sharpness]
-    """
     criterion = torch.nn.CrossEntropyLoss()
-    # Create Hessian linear operator using CurvLinOps
-    # Disable determinism check since data augmentation causes slight variations
-    H = HessianLinearOperator(
+
+    # 2. Check for NaN loss before starting expensive HVP
+    #    If the loss is already NaN, the Hessian is undefined.
+    with torch.no_grad():
+        initial_loss = criterion(model(inputs), targets)
+        if torch.isnan(initial_loss) or torch.isinf(initial_loss):
+            raise ValueError("Loss is NaN/Inf on this batch. Model has likely diverged.")
+
+    # 3. Create Linear Operator
+    H_op = HessianLinearOperator(
         model_func=model,
         loss_func=criterion,
-        data=[batch],
-        params=[p for p in model.parameters() if p.requires_grad],
+        data=[(inputs, targets)],
+        params=[p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad],
         check_deterministic=False,
     )
-    print(f"Hessian dimension: {H.shape}")
-    print(f"Total parameters: {H.shape[1]}")
 
-    # Check if num_matvecs is valid
-    min_dimension = min(H.shape)
-    if num_matvecs >= min_dimension:
-        print(
-            f"Warning: num_matvecs ({num_matvecs}) should be smaller than minimum dimension ({min_dimension})"
-        )
-        print(f"Reducing num_matvecs to {min_dimension - 1}")
-        num_matvecs = min_dimension - 1
+    # 4. Compute Top Eigenvalues (Spectral Norm)
+    print(f"   -> Computing Top {num_eigenvalues} Eigenvalues (Lanczos)...")
+    H_scipy = H_op.to_scipy()
 
-    # Compute squared Frobenius norm using CurvLinOps built-in function
-    print(
-        f"Computing squared Frobenius norm using {num_matvecs} matrix-vector products ({distribution} distribution)..."
+    # Use 'LM' (Largest Magnitude) to catch sharp negative curvature
+    eigenvalues, _ = eigsh(H_scipy, k=num_eigenvalues, which="LM", tol=1e-4)
+
+    # Sort and take max absolute value
+    eigenvalues = np.sort(np.abs(eigenvalues))[::-1]
+    lambda_max = float(eigenvalues[0])
+
+    # 5. Compute Trace
+    print("   -> Computing Trace (Hutchinson)...")
+    trace_tensor = hutchinson_trace(
+        H_op,
+        num_matvecs=num_trace_vecs,
+        distribution="rademacher",  # Rademacher (+1/-1) is strictly better than Gaussian for trace
     )
-    frob_norm_sq = hutchinson_squared_fro(
-        A=H,
-        num_matvecs=num_matvecs,
-        distribution=distribution,
+    trace_est = trace_tensor.item()  # No detach/cpu needed as we are already on CPU
+
+    # 6. Compute Squared Frobenius Norm
+    print("   -> Computing Frobenius Norm...")
+    frob_sq_tensor = hutchinson_squared_fro(
+        H_op, num_matvecs=num_trace_vecs, distribution="rademacher"
     )
-    print(f"Squared Frobenius norm (||H||_F²): {frob_norm_sq:.6e}")
+    frob_sq = frob_sq_tensor.item()
 
-    # Compute top eigenvalues for spectral norm and rank analysis
-    print(f"Computing top {top_k} eigenvalues...")
-    H_sp = H.to_scipy()
-    eigenvalues, _ = eigsh(H_sp, k=top_k, which="LM", tol=1e-4)
-    top_eigenvalue = np.max(np.abs(eigenvalues))
-    spectral_norm_sq = top_eigenvalue**2
+    # 7. Cleanup
+    del H_op
+    del H_scipy
 
-    print(f"Squared spectral norm (||H||_2²): {spectral_norm_sq:.6e}")
+    # 8. Derived Metrics
+    spectral_sq = lambda_max**2
+    stable_rank = frob_sq / (spectral_sq + 1e-12)  # epsilon to prevent div/0
 
-    # Compute stable rank: r(H) = ||H||_F² / ||H||_2²
-    stable_rank = frob_norm_sq / spectral_norm_sq
-    print(f"\nStable rank: {stable_rank:.6f}")
-
-    # Convert to Python floats for compatibility with matplotlib
-    if isinstance(stable_rank, torch.Tensor):
-        stable_rank = stable_rank.cpu().item()
-    else:
-        stable_rank = float(stable_rank)
-    
-    if isinstance(top_eigenvalue, torch.Tensor):
-        top_eigenvalue = top_eigenvalue.cpu().item()
-    else:
-        top_eigenvalue = float(top_eigenvalue)
-
-    return stable_rank, top_eigenvalue
+    return {"sharpness": lambda_max, "trace": trace_est, "stable_rank": stable_rank}
 
 
+# ==========================================
+# MAIN
+# ==========================================
 if __name__ == "__main__":
-    weights_path = "./model_weights/"  # Path to model weights directory
-    device = "cuda"
+    weights_path = "./model_weights/"
 
-    # Get weight files and sort by epoch number
+    # NOTE: We use CPU for analysis to ensure Float64 support,
+    # but we can check what the original training device was.
+    print(f"Analysis forced to CPU (Float64) for numerical stability.")
+
     weight_files = sorted(
-        os.listdir(weights_path),
-        key=lambda x: int(x.split("_")[-1].split(".")[0])  # Extract epoch number
+        os.listdir(weights_path), key=lambda x: int(x.split("_")[-1].split(".")[0])
     )
 
-    stable_ranks = []
-    sharpnesses = []
-    
-    traces = []
-    densities = []
-    for weight_file in weight_files:
-        weight_path = os.path.join(weights_path, weight_file)
+    history = {"epochs": [], "trace": [], "stable_rank": [], "sharpness": []}
 
+    # Load Data (CPU)
+    # We use a smaller batch size for analysis to keep it fast on CPU
+    train_loader = CifarLoader(
+        "cifar10", train=True, batch_size=128, aug=dict(flip=True, translate=2)
+    )
+    # Grab one fixed batch
+    fixed_inputs, fixed_targets = next(iter(train_loader))
+
+    for weight_file in weight_files:
+        epoch_num = int(weight_file.split("_")[-1].split(".")[0])
+        history["epochs"].append(epoch_num)
+
+        weight_path = os.path.join(weights_path, weight_file)
+        print(f"\nProcessing Epoch {epoch_num} ({weight_file})...")
         start_time = time.time()
 
-        # Load the model at this checkpoint
-        model = CifarNet().to(torch.device(device))
-        checkpoint = torch.load(weight_path, map_location=torch.device(device))
-        if "state_dict" in checkpoint:
-            model.load_state_dict(checkpoint["state_dict"])
-        else:
-            model.load_state_dict(checkpoint)
-        model.eval() 
+        try:
+            # Load Model
+            # Load onto CPU immediately
+            checkpoint = torch.load(weight_path, map_location="cpu")
+            model = CifarNet()
 
-        # Load a batch to compute L
-        train_loader = CifarLoader(
-            "cifar10", train=True, batch_size=500, aug=dict(flip=True, translate=2)
-        )
-        batch = next(iter(train_loader))
+            if "state_dict" in checkpoint:
+                model.load_state_dict(checkpoint["state_dict"])
+            else:
+                model.load_state_dict(checkpoint)
+            model.eval()
 
-        # Compute the metrics
-        stable_rank, sharpness = analyze_hessian_stable_rank(model, batch, device=device)
-        top_eigenvalues, trace = analyze_hessian_eigenvalues(model, batch, ev_num=10, device=device)
-        traces.append(trace)
-        stable_ranks.append(stable_rank)
-        sharpnesses.append(sharpness)
-        elapsed_time = time.time() - start_time
-        print(f"Processed {weight_file} in {elapsed_time:.2f} seconds")
+            # Integrity Check
+            if not check_model_integrity(model):
+                print(f"   [SKIP] Model weights invalid at epoch {epoch_num}")
+                # Append NaNs so plots don't break alignment
+                history["trace"].append(np.nan)
+                history["stable_rank"].append(np.nan)
+                history["sharpness"].append(np.nan)
+                continue
 
-    # Create plot with three subplots
-    epochs = list(range(len(stable_ranks)))
+            # Analyze
+            metrics = analyze_hessian_metrics(
+                model, (fixed_inputs, fixed_targets), num_eigenvalues=1, num_trace_vecs=100
+            )
 
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(16, 5))
+            history["trace"].append(metrics["trace"])
+            history["stable_rank"].append(metrics["stable_rank"])
+            history["sharpness"].append(metrics["sharpness"])
 
-    # Plot trace
-    ax1.plot(epochs, traces, marker="o", linewidth=2, markersize=6)
+            print(
+                f"   [Done] Sharpness: {metrics['sharpness']:.4f} | Trace: {metrics['trace']:.4f} | Stable Rank: {metrics['stable_rank']:.4f}"
+            )
+
+        except ValueError as ve:
+            print(f"   [SKIP] Calculation Error: {ve}")
+            history["trace"].append(np.nan)
+            history["stable_rank"].append(np.nan)
+            history["sharpness"].append(np.nan)
+
+        except Exception as e:
+            print(f"   [ERROR] Unexpected error: {e}")
+            raise e
+
+        # Cleanup
+        del model
+        gc.collect()  # Python GC
+        print(f"   Time taken: {time.time() - start_time:.2f}s")
+
+    # --- PLOTTING ---
+
+    print("\nGenerating Plots...")
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
+
+    epochs = history["epochs"]
+
+    # Filter out NaNs for plotting
+    valid_mask = ~np.isnan(history["trace"])
+    valid_epochs = np.array(epochs)[valid_mask]
+
+    ax1.plot(valid_epochs, np.array(history["trace"])[valid_mask], marker="o", color="teal")
+    ax1.set_title("Hessian Trace")
     ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Trace")
-    ax1.set_title("Hessian Trace vs Epoch")
     ax1.grid(True, alpha=0.3)
 
-    # Plot stable rank
-    ax2.plot(epochs, stable_ranks, marker="o", linewidth=2, markersize=6)
+    ax2.plot(valid_epochs, np.array(history["stable_rank"])[valid_mask], marker="^", color="purple")
+    ax2.set_title("Stable Rank")
     ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Stable Rank")
-    ax2.set_title("Hessian Stable Rank vs Epoch")
     ax2.grid(True, alpha=0.3)
 
-    # Plot sharpness (top eigenvalue)
-    ax3.plot(epochs, sharpnesses, marker="s", linewidth=2, markersize=6, color="orange")
+    ax3.plot(valid_epochs, np.array(history["sharpness"])[valid_mask], marker="s", color="orange")
+    ax3.set_title("Sharpness (Max Eigenvalue)")
     ax3.set_xlabel("Epoch")
-    ax3.set_ylabel("Sharpness")
-    ax3.set_title("Sharpness vs Epoch")
     ax3.grid(True, alpha=0.3)
 
     plt.tight_layout()
-    plt.savefig("hessian_metrics.png", dpi=150, bbox_inches="tight")
-    print("Plot saved to hessian_metrics.png")
-
-###########################################################################
-############ Cemetary of previous code which we might use later ###########
-###########################################################################
-# def analyze_weight_matrices(weight_path):
-#     """Analyze eigenvalues of weight matrices directly"""
-
-#     checkpoint = torch.load(weight_path, map_location="cpu")
-#     state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
-
-#     for name, param in state_dict.items():
-#         if "weight" in name and len(param.shape) == 2:  # 2D weight matrices
-#             # Convert to numpy for eigenvalue computation
-#             weight_matrix = param.detach().numpy()
-
-#             # Compute eigenvalues
-#             eigenvalues = np.linalg.eigvals(weight_matrix)
-
-#             print(f"\n{name}:")
-#             print(f"  Shape: {weight_matrix.shape}")
-#             print(f"  Top 5 eigenvalues: {eigenvalues[:5]}")
-#             print(f"  Spectral radius: {np.max(np.abs(eigenvalues)):.4f}")
-
-
-# def compute_diagonal_hessian(weight_path, batch_size=2000, device="cuda"):
-#     """Compute diagonal of Hessian - much more memory efficient"""
-#     # Load the model
-#     model = CifarNet().to(torch.device(device))
-#     train_loader = CifarLoader(
-#         "cifar10", train=True, batch_size=batch_size, aug=dict(flip=True, translate=2)
-#     )
-#     checkpoint = torch.load(weight_path, map_location=torch.device(device))
-#     if "state_dict" in checkpoint:
-#         model.load_state_dict(checkpoint["state_dict"])
-#     else:
-#         model.load_state_dict(checkpoint)
-#     model.eval()  # Set to evaluation mode
-
-#     model = extend(model)  # Extend model with Backpack functionality
-#     crit = extend(torch.nn.CrossEntropyLoss())
-#     data_iter = iter(train_loader)
-
-#     inputs, targets = next(data_iter)
-#     outputs = model(inputs)
-#     loss = crit(outputs, targets)
-
-#     with backpack(DiagHessian()):
-#         loss.backward()
-
-#     # Access diagonal Hessian for each parameter
-#     diag_hessian = []
-#     for name, param in model.named_parameters():
-#         diag_h = param.diag_h
-#         diag_hessian.append(diag_h.flatten())
-
-#     full_diag = torch.cat(diag_hessian)
-
-#     # Rank estimation from diagonal (approximate)
-#     threshold = 1e-6
-#     rank_estimate = torch.sum(full_diag > threshold).item()
-
-#     return full_diag, rank_estimate
+    plt.savefig("hessian_metrics_cpu.png", dpi=150)
+    print("Saved to hessian_metrics_cpu.png")

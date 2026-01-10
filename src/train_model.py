@@ -76,16 +76,36 @@ def batch_crop(images, crop_size):
 
 
 class CifarLoader:
-    def __init__(self, path, train=True, batch_size=500, aug=None):
+    def __init__(self, path, train=True, batch_size=500, aug=None, val_split=0.0, part="train"):
         data_path = os.path.join(path, "train.pt" if train else "test.pt")
         if not os.path.exists(data_path):
             dset = torchvision.datasets.CIFAR10(path, download=True, train=train)
             images = torch.tensor(dset.data)
             labels = torch.tensor(dset.targets)
+
+            # Reshuffle the loaded data
+            indices = torch.randperm(images.size(0))
+            images = images[indices]
+            labels = labels[indices]
+
             torch.save({"images": images, "labels": labels, "classes": dset.classes}, data_path)
 
         data = torch.load(data_path, map_location=device)
         self.images, self.labels, self.classes = data["images"], data["labels"], data["classes"]
+
+        if train and val_split > 0:
+            assert 0.0 < val_split < 1.0, "val_split must be between 0 and 1"
+            num_val = int(len(self.images) * val_split)
+            num_train = len(self.images) - num_val
+            if part == "train":
+                self.images = self.images[:num_train]
+                self.labels = self.labels[:num_train]
+            elif part == "val":
+                self.images = self.images[num_train:]
+                self.labels = self.labels[num_train:]
+            else:
+                raise ValueError(f"Invalid part '{part}'")
+
         # It's faster to load+process uint8 data than to load preprocessed fp16 data
         self.images = (
             (self.images.float() / 255).permute(0, 3, 1, 2).to(memory_format=torch.channels_last)
@@ -191,8 +211,9 @@ class ConvGroup(nn.Module):
 class CifarNet(nn.Module):
     def __init__(self):
         super().__init__()
-        # widths = dict(block1=64, block2=256, block3=256)
-        widths = dict(block1=32, block2=64, block3=64)
+        widths = dict(
+            block1=32, block2=64, block3=64
+        )  # we changed from (64, 256, 256) to work with less parameters
         whiten_kernel_size = 2
         whiten_width = 2 * 3 * whiten_kernel_size**2
         self.whiten = nn.Conv2d(3, whiten_width, whiten_kernel_size, padding=0, bias=True)
@@ -263,7 +284,7 @@ def print_columns(columns_list, is_head=False, is_final_entry=False):
         print("-" * len(print_string))
 
 
-logging_columns_list = ["run   ", "epoch", "train_acc", "val_acc", "tta_val_acc", "time_seconds"]
+logging_columns_list = ["run   ", "epoch", "train_acc", "val_acc", "test_acc", "time_seconds"]
 
 
 def print_training_details(variables, is_final_entry):
@@ -338,9 +359,20 @@ def main(run, model):
     head_lr = 0.67
     wd = 2e-6 * batch_size
 
+    # Use a specific split for validation (e.g., 20% of the training data)
+    val_split = 0.2
+
     test_loader = CifarLoader("cifar10", train=False, batch_size=2000)
+    val_loader = CifarLoader(
+        "cifar10", train=True, batch_size=2000, val_split=val_split, part="val"
+    )
     train_loader = CifarLoader(
-        "cifar10", train=True, batch_size=batch_size, aug=dict(flip=True, translate=2)
+        "cifar10",
+        train=True,
+        batch_size=batch_size,
+        aug=dict(flip=True, translate=2),
+        val_split=val_split,
+        part="train",
     )
     num_epochs = 8
 
@@ -386,12 +418,15 @@ def main(run, model):
 
     model.reset()
     step = 0
-    val_accs = []  # Track validation accuracies for plotting
+    train_accs = []
+    val_accs = []
+    test_accs = []
 
     # Initialize the whitening layer using training images
     # start_timer()
-    # train_images = train_loader.normalize(train_loader.images[:5000])
-    # model.init_whiten(train_images)
+    if device != torch.device("mps"):  # whitening does not work with mps
+        train_images = train_loader.normalize(train_loader.images[:5000])
+        model.init_whiten(train_images)
     # stop_timer()
 
     for epoch in range(ceil(total_train_steps / len(train_loader))):
@@ -442,31 +477,50 @@ def main(run, model):
         ####################
 
         # Save the accuracy and loss from the last training batch of the epoch
-        # train_acc = (outputs.detach().argmax(1) == labels).float().mean().item()
         model.eval()
-        val_acc = evaluate(model, test_loader, tta_level=0)
+        train_acc = evaluate(model, train_loader, tta_level=0)
+        train_accs.append(train_acc)
+        val_acc = evaluate(model, val_loader, tta_level=0)
         val_accs.append(val_acc)
-        # print(f"Epoch {epoch} - Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}")
-        
+        test_acc = evaluate(model, test_loader, tta_level=0)
+        test_accs.append(test_acc)
+        print(
+            f"Epoch {epoch} - Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}\n"
+        )
+
     # Save validation accuracy plot
     plt.figure(figsize=(10, 6))
-    plt.plot(range(len(val_accs)), val_accs, marker='o', linestyle='-', color='blue')
-    plt.xlabel('Epoch')
-    plt.ylabel('Validation Accuracy')
-    plt.title('Validation Accuracy over Training')
+    plt.plot(
+        range(len(train_accs)),
+        train_accs,
+        marker="s",
+        linestyle="--",
+        color="orange",
+        label="Training Accuracy",
+    )
+    plt.plot(
+        range(len(val_accs)),
+        val_accs,
+        marker="o",
+        linestyle="-",
+        color="blue",
+        label="Validation Accuracy",
+    )
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.title("Training vs. Validation Accuracy over Epochs")
+    plt.legend()
     plt.grid(True)
-    plt.savefig('val_accuracy_plot.png', dpi=150, bbox_inches='tight')
+    plt.savefig("accuracy_comparison_plot.png", dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"Saved validation accuracy plot to val_accuracy_plot.png")
-        # print_training_details(locals(), is_final_entry=False)
-        # run = None # Only print the run number once
+    print(f"Saved comparison accuracy plot to accuracy_comparison_plot.png")
 
     ####################
     #  TTA Evaluation  #
     ####################
 
     # start_timer()
-    tta_val_acc = evaluate(model, test_loader, tta_level=2)
+    test_acc = evaluate(model, test_loader, tta_level=2)
     # stop_timer()
     epoch_label = "eval"
     print_training_details({**locals(), "epoch": epoch_label}, is_final_entry=True)
@@ -476,7 +530,7 @@ def main(run, model):
     total_training_time = total_end_time - total_start_time
     print(f"Total training time: {total_training_time:.4f} seconds")
 
-    return tta_val_acc
+    return test_acc
 
 
 if __name__ == "__main__":
@@ -501,11 +555,3 @@ if __name__ == "__main__":
     # main("warmup", model)
     accs = torch.tensor([main(run, model) for run in range(1)])
     print("Mean: %.4f    Std: %.4f" % (accs.mean(), accs.std()))
-
-    # log_dir = os.path.join("logs", str(uuid.uuid4()))
-    # os.makedirs(log_dir, exist_ok=True)
-    # log_path = os.path.join(log_dir, "log.pt")
-    # torch.save(dict(code=code, accs=accs), log_path)
-    # print(os.path.abspath(log_path))
-
-    ### PyHessian Code ###
