@@ -29,3 +29,4 @@ pyhessian
 curvlinops-for-pytorch
 backpack-for-pytorch
 matplotlib
+wandb

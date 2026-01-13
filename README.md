@@ -68,11 +68,6 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements-dev.txt
 ```
 
-4. Install pre-commit hooks:
-```bash
-pre-commit install
-```
-
 ## Code Quality Tools
 
 ### 1. Black (Code Formatter)
