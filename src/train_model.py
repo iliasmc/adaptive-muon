@@ -25,14 +25,14 @@ from datetime import datetime
 
 from .muon_original import Muon
 
-# Set global timestamp to save all artifacts with the same timestamp
-timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-
-
 #############################################
 #           Parse experiment params         #
 #############################################
 parser = argparse.ArgumentParser(description="Adaptive Muon CNN Training Runner")
+# High level args
+parser.add_argument("--timestamp", type=str, default=None, help="Timestamp for the run (overrides auto-generation)")
+parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True, help="Whether to store results in WANDB")
+
 # CNN architecture params
 parser.add_argument("--block1", type=int, default=24, help="Width of CNN block 1")
 parser.add_argument("--block2", type=int, default=48, help="Width of CNN block 2")
@@ -40,8 +40,8 @@ parser.add_argument("--block3", type=int, default=48, help="Width of CNN block 3
 parser.add_argument("--whitening", action=argparse.BooleanOptionalAction, default=True, help="Whether to apply whitening")
 
 # Dataset/batch size
-parser.add_argument("--batch_size", type=int, default=128, help="Batch size for training")
-parser.add_argument("--val_split", type=float, default=0.2, help="Validation split (0.0 to 1.0)")
+parser.add_argument("--batch_size", type=int, default=512, help="Batch size for training")
+parser.add_argument("--val_split", type=float, default=0.1, help="Validation split (0.0 to 1.0)")
 
 # Run config
 parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs")
@@ -63,6 +63,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 else:
     args = parser.parse_args([])
+
+# Set global timestamp
+if args.timestamp:
+    timestamp = args.timestamp
+else:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
 # Have all args in a single string for easy comparison through WANDB
 run_name = (
@@ -667,7 +673,8 @@ if __name__ == "__main__":
         entity="adaptive-muon",
         project="cnn-training", 
         config=config_dict,
-        name=config_dict['run_name']
+        name=config_dict['run_name'],
+        mode="disabled" if not args.wandb else "online"
     )
     ### Training code ###
     model = CifarNet(block1=args.block1,
@@ -680,7 +687,11 @@ if __name__ == "__main__":
 
     # Only compile on CUDA systems
     if torch.cuda.is_available():
-        model.compile(mode="max-autotune")
+        major, minor = torch.cuda.get_device_capability()
+        if major >= 7:
+            model.compile(mode="max-autotune")
+        else:
+            print(f"Warning: GPU capability {major}.{minor} < 7.0. Skipping torch.compile (Triton not supported).")
     else:
         print(
             "Warning: Running without torch.compile (CUDA not available). Performance will be significantly slower."

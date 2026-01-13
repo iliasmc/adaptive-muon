@@ -145,13 +145,13 @@ def _compute_epoch_metrics(model, fixed_batch):
 
     # Global Hessian analysis
     # TODO: issue with trace and stable rank approaching inf for some reason -> perhaps mps issue
-    # filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
-    # if filter_params:
-    #     metrics = analyze_layer_hessian(
-    #         model, "global", filter_params, fixed_batch
-    #     )
-    #     print(f"     -> Sharpness: {metrics['sharpness']:.4f}, Trace: {metrics['trace']:.4f}, Stable Rank: {metrics['stable_rank']:.4f}, Effective Rank: {metrics['effective_rank']:.4f}")
-    #     epoch_data["global"] = metrics
+    filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
+    if filter_params:
+        metrics = analyze_layer_hessian(
+            model, "global", filter_params, fixed_batch
+        )
+        print(f"     -> Sharpness: {metrics['sharpness']:.4f}, Trace: {metrics['trace']:.4f}, Stable Rank: {metrics['stable_rank']:.4f}, Effective Rank: {metrics['effective_rank']:.4f}")
+        epoch_data["global"] = metrics
 
     return epoch_data
 
@@ -282,7 +282,8 @@ if __name__ == "__main__":
         entity="adaptive-muon",
         project="hessian-metrics", 
         config=vars(args),
-        name=experiment_args.run_name
+        name=experiment_args.run_name,
+        mode="disabled" if not experiment_args.wandb else "online"
     )
 
     run_hessian_analysis(args.run_path, args.batch_size, experiment_args)
