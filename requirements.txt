@@ -1,5 +1,5 @@
 # Development Dependencies
-# Install with: pip install -r requirements-dev.txt
+# Install with: pip install -r requirements.txt
 
 # Code formatting
 black>=23.0.0
@@ -18,14 +18,12 @@ pytest>=7.0.0
 pytest-cov>=4.0.0
 pytest-xdist>=3.0.0
 
-# Pre-commit hooks
-pre-commit>=3.0.0
-
 # PyTorch (CPU version for development)
-torch>=2.0.0
+torc<==2.4.1
 torchvision>=0.15.0
 numpy>=1.21.0
 pyhessian
 curvlinops-for-pytorch
 backpack-for-pytorch
 matplotlib
+wandb
