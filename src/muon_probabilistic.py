@@ -42,33 +42,40 @@ class Muon(torch.optim.Optimizer):
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov)
 
         self.current_step = 0
-        self.prob_orth = 1.0
-        self.decay_rate = 0.004
-        self.step_size = 25
-        self.scheduler = "cosine_annealing"
+        self.current_epoch = 0
+        self.cycle_size = 3
+        self.prob_orth = 0.9
+        self.decay_rate = 0.069
+        self.step_size = 2
+        self.scheduler = "uniform"
         self.pr_min = 0
         self.pr_max = 0.8
         self.orthogonalization_count = 0
         self.skipped_orthogonalization_count = 0
+        np.random.seed(1)
 
         super().__init__(params, defaults)
-
+    
+    def update_epoch(self):
+        self.current_epoch = self.current_epoch + 1
+    
     def step(self):
-        np.random.seed(42)
         self.current_step += 1
-
+        
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
-            if self.scheduler == "exponential":
+            if self.scheduler == "uniform":
+                do_orth = bool(np.random.binomial(1, self.prob_orth))
+            elif self.scheduler == "exponential":
                 # best combination for now decay_rate = 0.0038 and prob_orth = 1.0
-                prob_orth = self.prob_orth* np.exp(-self.decay_rate * self.current_step)
+                prob_orth = self.prob_orth* np.exp(-self.decay_rate * self.current_epoch)
                 do_orth = bool(np.random.binomial(1, prob_orth))
             elif self.scheduler == "step_decay":
-                prob_orth = self.prob_orth * (self.decay_rate ** np.floor(self.current_step/self.step_size))
+                prob_orth = self.prob_orth * (self.decay_rate ** np.floor(self.current_epoch/self.step_size))
                 do_orth = bool(np.random.binomial(1, prob_orth))
             elif self.scheduler == "cosine_annealing":
-                prob_orth = self.pr_min + 0.5 * (self.pr_max - self.pr_min) * (1 + np.cos(self.current_step/ 1200 * np.pi))
+                prob_orth = self.pr_min + 0.5 * (self.pr_max - self.pr_min) * (1 + np.cos(self.current_epoch/ self.cycle_size * np.pi))
                 do_orth = bool(np.random.binomial(1, prob_orth))
             elif self.scheduler == "cyclic":
                 cycle = np.floor( 1 + self.current_step/(2*self.stepsize))
@@ -78,8 +85,9 @@ class Muon(torch.optim.Optimizer):
             else:
                 print(f"The picked scheduler: {self.scheduler} has not been implemented!")
                 return 
-
+            # print("THIS IS A STEP!") -> once 
             for p in group["params"]:
+                # print("THIS IS A GROUP!") -> six times
                 g = p.grad
                 if g is None:
                     continue
@@ -104,9 +112,9 @@ class Muon(torch.optim.Optimizer):
                     )  # whiten the update
                     state["buffer"].copy_(update)
                     self.orthogonalization_count += 1
+                    # p.data.mul_(len(p.data) ** 0.5 / p.data.norm())  # normalize the weight
+                    p.data.add_(update, alpha=-lr)  # take a step
                 else:
-                    # reuse previous orthogonalized direction
-                    update = state["buffer"]
                     # update = g
                     self.skipped_orthogonalization_count += 1
-                p.data.add_(update, alpha=-lr)  # take a step
+                    p.data.add_(g, alpha=-lr)
