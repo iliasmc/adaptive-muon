@@ -1,6 +1,10 @@
 # Manually added
 cifar10
 model_weights
+*.png
+wandb
+*experimental_config.json
+*.out
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

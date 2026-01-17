@@ -1,5 +1,5 @@
 """
-The main file for running experiments. Taken from https://github.com/KellerJordan/cifar10-airbench.
+The main file for running experiments. Adjusted from https://github.com/KellerJordan/cifar10-airbench.
 """
 
 #############################################
@@ -7,19 +7,84 @@ The main file for running experiments. Taken from https://github.com/KellerJorda
 #############################################
 
 import os
+import argparse 
+import json
+import wandb
 
-# with open(sys.argv[0]) as f:
-#     code = f.read()
 import time
-from math import ceil
+from math import ceil, cos, pi
+from tqdm import tqdm
 
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as T
 from torch import nn
+from datetime import datetime
 
-from muon_probabilistic import Muon
+from .muon_original import Muon
+
+#############################################
+#           Parse experiment params         #
+#############################################
+parser = argparse.ArgumentParser(description="Adaptive Muon CNN Training Runner")
+# High level args
+parser.add_argument("--timestamp", type=str, default=None, help="Timestamp for the run (overrides auto-generation)")
+parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True, help="Whether to store results in WANDB")
+
+# CNN architecture params
+parser.add_argument("--block1", type=int, default=24, help="Width of CNN block 1")
+parser.add_argument("--block2", type=int, default=48, help="Width of CNN block 2")
+parser.add_argument("--block3", type=int, default=48, help="Width of CNN block 3")
+parser.add_argument("--whitening", action=argparse.BooleanOptionalAction, default=True, help="Whether to apply whitening")
+
+# Dataset/batch size
+parser.add_argument("--batch_size", type=int, default=512, help="Batch size for training")
+parser.add_argument("--val_split", type=float, default=0.1, help="Validation split (0.0 to 1.0)")
+
+# Run config
+parser.add_argument("--num_epochs", type=int, default=100, help="Number of training epochs")
+
+# Optimizer hyperparameters
+parser.add_argument("--bias_lr", type=float, default=0.01, help="Initial learning rate for the bias parameters with SGD")
+parser.add_argument("--head_lr", type=float, default=0.6, help="Initial learning rate for the head parameters with SGD")
+parser.add_argument("--conv_optimizer", type=str, default="muon", choices=["muon", "sgd", "adaptive"], help="The optimizer to use for the convolutional layers")
+parser.add_argument("--conv_lr", type=float, default=0.01, help="Initial learning rate for the optimizer chosen for the convolutional layers")
+parser.add_argument("--conv_momentum", type=float, default=0.85, help="Momentum for the convolutional layers")
+parser.add_argument("--scheduler", type=str, choices=["cosine", "linear"], default="cosine", help="LR scheduler type")
+parser.add_argument("--sgd_momentum", type=float, default=0.85, help="Momentum for SGD (optimizer1)")
+
+# Directory under which to store artifacts
+parser.add_argument("--results_root", type=str, default=".", help="Root directory to store results in")
+parser.add_argument("--run_name", type=str, default="", help="The name to store the run by in WANDB. If no value passed, a collection of all previous args will be used.")
+
+if __name__ == "__main__":
+    args = parser.parse_args()
+else:
+    args = parser.parse_args([])
+
+# Set global timestamp
+if args.timestamp:
+    timestamp = args.timestamp
+else:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+# Have all args in a single string for easy comparison through WANDB
+run_name = (
+    f"blk-{args.block1}-{args.block2}-{args.block3},"
+    f"bs-{args.batch_size},"
+    f"val-{args.val_split},"
+    f"whtn-{int(args.whitening)},"
+    f"ep-{args.num_epochs},"
+    f"blr-{args.bias_lr},"
+    f"hlr-{args.head_lr},"
+    f"opt-{args.conv_optimizer},"
+    f"clr-{args.conv_lr},"
+    f"cmom-{args.conv_momentum},"
+    f"sch-{args.scheduler},"
+    f"smom-{args.sgd_momentum}"
+)
 
 #############################################
 #             Select PyTorch device         #
@@ -31,7 +96,6 @@ elif torch.backends.mps.is_available():
     device = torch.device("mps")
 else:
     device = torch.device("cpu")
-print(f"Using device: {device}")
 
 
 #############################################
@@ -75,16 +139,36 @@ def batch_crop(images, crop_size):
 
 
 class CifarLoader:
-    def __init__(self, path, train=True, batch_size=500, aug=None):
+    def __init__(self, path, train=True, batch_size=500, aug=None, val_split=0.0, part="train"):
         data_path = os.path.join(path, "train.pt" if train else "test.pt")
         if not os.path.exists(data_path):
             dset = torchvision.datasets.CIFAR10(path, download=True, train=train)
             images = torch.tensor(dset.data)
             labels = torch.tensor(dset.targets)
+
+            # Reshuffle the loaded data
+            indices = torch.randperm(images.size(0))
+            images = images[indices]
+            labels = labels[indices]
+
             torch.save({"images": images, "labels": labels, "classes": dset.classes}, data_path)
 
         data = torch.load(data_path, map_location=device)
         self.images, self.labels, self.classes = data["images"], data["labels"], data["classes"]
+
+        if train:
+            assert 0.0 <= val_split < 1.0, "val_split must be between 0 and 1"
+            num_val = int(len(self.images) * val_split)
+            num_train = len(self.images) - num_val
+            if part == "train":
+                self.images = self.images[:num_train]
+                self.labels = self.labels[:num_train]
+            elif part == "val":
+                self.images = self.images[num_train:]
+                self.labels = self.labels[num_train:]
+            else:
+                raise ValueError(f"Invalid part '{part}'")
+
         # It's faster to load+process uint8 data than to load preprocessed fp16 data
         self.images = (
             (self.images.float() / 255).permute(0, 3, 1, 2).to(memory_format=torch.channels_last)
@@ -188,20 +272,30 @@ class ConvGroup(nn.Module):
 
 
 class CifarNet(nn.Module):
-    def __init__(self):
+    def __init__(self, block1:int, block2:int, block3:int, apply_whitening:bool):
         super().__init__()
-        widths = dict(block1=64, block2=256, block3=256)
-        whiten_kernel_size = 2
-        whiten_width = 2 * 3 * whiten_kernel_size**2
-        self.whiten = nn.Conv2d(3, whiten_width, whiten_kernel_size, padding=0, bias=True)
-        self.whiten.weight.requires_grad = False
-        self.layers = nn.Sequential(
-            nn.GELU(),
-            ConvGroup(whiten_width, widths["block1"]),
-            ConvGroup(widths["block1"], widths["block2"]),
-            ConvGroup(widths["block2"], widths["block3"]),
-            nn.MaxPool2d(3, return_indices=True),
-        )
+        self.apply_whitening = apply_whitening
+        widths = dict(block1=block1, block2=block2, block3=block3)
+        if self.apply_whitening:
+            whiten_kernel_size = 2
+            whiten_width = 2 * 3 * whiten_kernel_size**2
+            self.whiten = nn.Conv2d(3, whiten_width, whiten_kernel_size, padding=0, bias=True)
+            self.whiten.weight.requires_grad = False
+            self.layers = nn.Sequential(
+                nn.GELU(),
+                ConvGroup(whiten_width, widths["block1"]),
+                ConvGroup(widths["block1"], widths["block2"]),
+                ConvGroup(widths["block2"], widths["block3"]),
+                nn.MaxPool2d(3, return_indices=True),
+            )
+        else:
+            self.layers = nn.Sequential(
+                nn.GELU(),
+                ConvGroup(3, widths["block1"]),
+                ConvGroup(widths["block1"], widths["block2"]),
+                ConvGroup(widths["block2"], widths["block3"]),
+                nn.MaxPool2d(3, return_indices=True),
+            )
         self.head = nn.Linear(widths["block3"], 10, bias=False)
         for mod in self.modules():
             if isinstance(mod, BatchNorm):
@@ -227,20 +321,33 @@ class CifarNet(nn.Module):
         )
         patches_flat = patches.view(len(patches), -1)
         est_patch_covariance = (patches_flat.T @ patches_flat) / len(patches_flat)
-        eigenvalues, eigenvectors = torch.linalg.eigh(est_patch_covariance, UPLO="U")
+        
+        # FIX: Move to CPU for eigenvalue decomposition (not supported on MPS)
+        # We store the original device to move results back later
+        orig_device = est_patch_covariance.device
+        cov_cpu = est_patch_covariance.cpu()
+        
+        eigenvalues, eigenvectors = torch.linalg.eigh(cov_cpu, UPLO="U")
+        
+        # Move results back to the original device (MPS or CUDA)
+        eigenvalues = eigenvalues.to(orig_device)
+        eigenvectors = eigenvectors.to(orig_device)
+        
         eigenvectors_scaled = eigenvectors.T.reshape(-1, c, h, w) / torch.sqrt(
             eigenvalues.view(-1, 1, 1, 1) + eps
         )
         self.whiten.weight.data[:] = torch.cat((eigenvectors_scaled, -eigenvectors_scaled))
-
+    
+    
     def forward(self, x, whiten_bias_grad=True):
         b = self.whiten.bias
-        x = F.conv2d(x, self.whiten.weight, b if whiten_bias_grad else b.detach())
+        if self.apply_whitening:
+            x = F.conv2d(x, self.whiten.weight, b if whiten_bias_grad else b.detach())
         x = self.layers(x)
         # Unpack tuple if return_indices=True was used in MaxPool2d
         if isinstance(x, tuple):
             x = x[0]
-        x = x.view(len(x), -1)
+        x = x.reshape(len(x), -1)
         return self.head(x) / x.size(-1)
 
 
@@ -261,7 +368,7 @@ def print_columns(columns_list, is_head=False, is_final_entry=False):
         print("-" * len(print_string))
 
 
-logging_columns_list = ["run   ", "epoch", "train_acc", "val_acc", "tta_val_acc", "time_seconds"]
+logging_columns_list = ["run   ", "epoch", "train_acc", "val_acc", "test_acc", "time_seconds"]
 
 
 def print_training_details(variables, is_final_entry):
@@ -331,22 +438,34 @@ def evaluate(model, loader, tta_level=0):
 
 
 def main(run, model):
-    batch_size = 2000
-    bias_lr = 0.053
-    head_lr = 0.67
+    batch_size = args.batch_size
+    bias_lr = args.bias_lr #0.053
+    head_lr = args.head_lr #0.67
     wd = 2e-6 * batch_size
 
-    test_loader = CifarLoader("/work/scratch/amihalkova", train=False, batch_size=2000)
-    train_loader = CifarLoader(
-        "/work/scratch/amihalkova", train=True, batch_size=batch_size, aug=dict(flip=True, translate=2)
+    # Use a specific split for validation (e.g., 20% of the training data)
+    val_split = args.val_split
+
+    test_loader = CifarLoader("cifar10", train=False, batch_size=2000)
+    val_loader = CifarLoader(
+        "cifar10", train=True, batch_size=2000, val_split=val_split, part="val"
     )
+    train_loader = CifarLoader(
+        "cifar10",
+        train=True,
+        batch_size=batch_size,
+        aug=dict(flip=True, translate=4),
+        val_split=val_split,
+        part="train",
+    )
+    num_epochs = args.num_epochs
 
     if run == "warmup":
         # The only purpose of the first run is to warmup the compiled model, so we can use dummy data
         train_loader.labels = torch.randint(
             0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device
         )
-    total_train_steps = ceil(8 * len(train_loader))
+    total_train_steps = ceil(num_epochs * len(train_loader))
     whiten_bias_train_steps = ceil(3 * len(train_loader))
 
     # Start total training timer
@@ -362,8 +481,13 @@ def main(run, model):
     ]
     # Use fused optimizer only on CUDA
     use_fused = torch.cuda.is_available()
-    optimizer1 = torch.optim.SGD(param_configs, momentum=0.85, nesterov=True, fused=use_fused)
-    optimizer2 = Muon(filter_params, lr=0.24, momentum=0.6, nesterov=True)
+    optimizer1 = torch.optim.SGD(param_configs, momentum=args.sgd_momentum, nesterov=True, fused=use_fused)
+    if args.conv_optimizer == "muon":
+        optimizer2 = Muon(filter_params, lr=args.conv_lr, momentum=args.conv_momentum, nesterov=True)
+    elif args.conv_optimizer == "sgd":
+        optimizer2 = torch.optim.SGD(filter_params, lr=args.conv_lr, momentum=args.conv_momentum, nesterov=True, weight_decay=wd/args.conv_lr, fused=use_fused)
+    else:
+        raise NotImplementedError("Need to put our adaptive muon optimizer here")
     optimizers = [optimizer1, optimizer2]
     for opt in optimizers:
         for group in opt.param_groups:
@@ -383,14 +507,18 @@ def main(run, model):
 
     model.reset()
     step = 0
+    train_accs = []
+    val_accs = []
+    test_accs = []
 
     # Initialize the whitening layer using training images
     # start_timer()
-    # train_images = train_loader.normalize(train_loader.images[:5000])
-    # model.init_whiten(train_images)
+    if args.whitening:
+        train_images = train_loader.normalize(train_loader.images[:5000])
+        model.init_whiten(train_images)
     # stop_timer()
 
-    for epoch in range(ceil(total_train_steps / len(train_loader))):
+    for epoch in tqdm(range(ceil(total_train_steps / len(train_loader)))):
         print(f"At epoch: {epoch}")
 
         # Start epoch timer
@@ -402,13 +530,24 @@ def main(run, model):
 
         # start_timer()
         model.train()
+        epoch_train_loss = 0.0
         for inputs, labels in train_loader:
             outputs = model(inputs, whiten_bias_grad=(step < whiten_bias_train_steps))
-            F.cross_entropy(outputs, labels, label_smoothing=0.2, reduction="sum").backward()
+            ce_loss = F.cross_entropy(outputs, labels, label_smoothing=0.2, reduction="sum")
+            ce_loss.backward()
+
+            epoch_train_loss += ce_loss.item()
+
+            # The LR for the whitening layer params
             for group in optimizer1.param_groups[:1]:
                 group["lr"] = group["initial_lr"] * (1 - step / whiten_bias_train_steps)
+            # The LR for the rest of the params
             for group in optimizer1.param_groups[1:] + optimizer2.param_groups:
-                group["lr"] = group["initial_lr"] * (1 - step / total_train_steps)
+                if args.scheduler == "cosine":
+                    decay = 0.5 * (1 + cos(pi * (step / total_train_steps)))
+                else: # linear
+                    decay = (1 - step / total_train_steps)
+                group["lr"] = group["initial_lr"] * decay
             for opt in optimizers:
                 opt.step()
             model.zero_grad(set_to_none=True)
@@ -424,8 +563,8 @@ def main(run, model):
         # Store model weights
         # Save model weights after each epoch into the model_weights/ directory
         try:
-            os.makedirs("model_weights", exist_ok=True)
-            weight_path = os.path.join("model_weights", f"model_epoch_{epoch}.pt")
+            os.makedirs(f"{args.results_root}/{timestamp}/model_weights", exist_ok=True)
+            weight_path = os.path.join(args.results_root, timestamp, "model_weights", f"model_epoch_{epoch}.pt")
             torch.save({"epoch": epoch, "state_dict": model.state_dict()}, weight_path)
             print(f"Saved model weights to {os.path.abspath(weight_path)}")
         except Exception as e:
@@ -436,19 +575,73 @@ def main(run, model):
         ####################
         #    Evaluation    #
         ####################
+        model.eval()
 
-        # Save the accuracy and loss from the last training batch of the epoch
-        # train_acc = (outputs.detach().argmax(1) == labels).float().mean().item()
-        # val_acc = evaluate(model, test_loader, tta_level=0)
-        # print_training_details(locals(), is_final_entry=False)
-        # run = None # Only print the run number once
+        # Calculate Test Loss
+        epoch_test_loss = 0.0
+        with torch.no_grad():
+            for inputs, labels in test_loader:
+                outputs = model(inputs)
+                loss = F.cross_entropy(outputs, labels, reduction="sum")
+                epoch_test_loss += loss.item()
+        
+        # Calculate Validation Loss
+        epoch_val_loss = 0.0
+        if len(val_loader.images) > 0:
+            with torch.no_grad():
+                for inputs, labels in val_loader:
+                    outputs = model(inputs)
+                    loss = F.cross_entropy(outputs, labels, reduction="sum")
+                    epoch_val_loss += loss.item()
+        else:
+            epoch_val_loss = 0.0
+
+        # Get all accuracies
+        train_acc = evaluate(model, train_loader, tta_level=0)
+        train_accs.append(train_acc)
+        if len(val_loader.images) > 0:
+            val_acc = evaluate(model, val_loader, tta_level=0)
+        else:
+            val_acc = 0
+        val_accs.append(val_acc)
+        test_acc = evaluate(model, test_loader, tta_level=0)
+        test_accs.append(test_acc)
+        print(
+            f"Epoch {epoch} - Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}\n"
+        )
+        # Log to WANDB
+        avg_train_loss = epoch_train_loss / len(train_loader.images)
+        avg_test_loss = epoch_test_loss / len(test_loader.images)
+        avg_val_loss = epoch_val_loss / len(val_loader.images) if len(val_loader.images) > 0 else 0
+        wandb.log({
+            "epoch": epoch,
+            "train/loss": avg_train_loss,
+            "train/acc": train_acc,
+            "test/loss": avg_test_loss,
+            "test/acc": test_acc,
+            "val/loss": avg_val_loss,
+            "val/acc": val_acc,
+            "conv_lr": optimizer2.param_groups[0]["lr"], # Tracks the main LR
+            "epoch_duration": epoch_duration
+        })
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(len(train_accs)), train_accs, marker="s", linestyle="--", color="orange", label="Training Accuracy")
+    plt.plot(range(len(test_accs)), test_accs, marker="o", linestyle="-", color="blue", label="Test Accuracy")
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.title("Training vs. Test Accuracy over Epochs")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(f"{args.results_root}/{timestamp}/accuracy_comparison.png", dpi=150, bbox_inches="tight")
+    plt.close()
 
     ####################
     #  TTA Evaluation  #
     ####################
 
     # start_timer()
-    tta_val_acc = evaluate(model, test_loader, tta_level=2)
+    test_acc = evaluate(model, test_loader, tta_level=2)
     # stop_timer()
     epoch_label = "eval"
     print_training_details({**locals(), "epoch": epoch_label}, is_final_entry=True)
@@ -457,23 +650,48 @@ def main(run, model):
     total_end_time = time.time()
     total_training_time = total_end_time - total_start_time
     print(f"Total training time: {total_training_time:.4f} seconds")
-    print("Skipped steps:", optimizer2.skipped_orthogonalization_count)
-    print("Non-skipped steps:", optimizer2.orthogonalization_count)
-    return tta_val_acc
+
+    return test_acc
 
 
 if __name__ == "__main__":
-    # We re-use the compiled model between runs to save the non-data-dependent compilation time
-    # Move the model to the selected device. Inputs are already set to channels-last in the loader.
+    ### Store experimental dict
+    config_dict = vars(args)
+    config_dict['timestamp'] = timestamp
+    config_dict['run_name'] = args.run_name if args.run_name != "" else run_name
+    print("\n--- Running Experiment with Configuration ---")
+    print(json.dumps(config_dict, indent=4))
+    print("--------------------------------------------\n")
+    output_dir = os.path.join(args.results_root, timestamp)
+    os.makedirs(output_dir, exist_ok=True)
+    config_path = os.path.join(output_dir, "experimental_config.json")
+    with open(config_path, "w") as f:
+        json.dump(config_dict, f, indent=4)
+
+    ## Setup WandB for tracking experiments ##
+    wandb.init(
+        entity="adaptive-muon",
+        project="cnn-training", 
+        config=config_dict,
+        name=config_dict['run_name'],
+        mode="disabled" if not args.wandb else "online"
+    )
     ### Training code ###
-    model = CifarNet().to(device)
+    model = CifarNet(block1=args.block1,
+                     block2=args.block2,
+                     block3=args.block3,
+                     apply_whitening=args.whitening).to(device)
     print(model)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params}")
 
-    # Only compile on CUDA systems (Mac doesn't support CUDA-specific optimizations)
+    # Only compile on CUDA systems
     if torch.cuda.is_available():
-        model.compile(mode="max-autotune")
+        major, minor = torch.cuda.get_device_capability()
+        if major >= 7:
+            model.compile(mode="max-autotune")
+        else:
+            print(f"Warning: GPU capability {major}.{minor} < 7.0. Skipping torch.compile (Triton not supported).")
     else:
         print(
             "Warning: Running without torch.compile (CUDA not available). Performance will be significantly slower."
@@ -483,12 +701,5 @@ if __name__ == "__main__":
     print_columns(logging_columns_list, is_head=True)
     # main("warmup", model)
     accs = torch.tensor([main(run, model) for run in range(1)])
-    print("Mean: %.4f    Std: %.4f" % (accs.mean(), accs.std()))
-
-    # log_dir = os.path.join("logs", str(uuid.uuid4()))
-    # os.makedirs(log_dir, exist_ok=True)
-    # log_path = os.path.join(log_dir, "log.pt")
-    # torch.save(dict(code=code, accs=accs), log_path)
-    # print(os.path.abspath(log_path))
-
-    ### PyHessian Code ###
+    # print("Mean: %.4f    Std: %.4f" % (accs.mean(), accs.std()))
+    wandb.finish()

@@ -4,11 +4,16 @@ Utility functions for PyTorch training and data handling.
 This module provides helper functions for common tasks in PyTorch projects.
 """
 
+import argparse
+import json
+import os
 import random
 from typing import Optional
 
 import numpy as np
 import torch
+
+from .train_model import CifarLoader, CifarNet, ConvGroup
 
 
 def set_seed(seed: int = 42) -> None:
@@ -140,3 +145,53 @@ def load_checkpoint(
     model.load_state_dict(checkpoint["model_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     return checkpoint["epoch"]
+
+def get_conv_layers(model):
+    """
+    Extracts the 6 convolution layers from CifarNet.
+    Returns a list of tuples: (layer_name, parameter_list)
+    """
+    layers = []
+    # CifarNet structure:
+    # model.layers is Sequential
+    # [1] -> ConvGroup -> conv1, conv2
+    # [2] -> ConvGroup -> conv1, conv2
+    # [3] -> ConvGroup -> conv1, conv2
+    
+    # Identify ConvGroup blocks
+    groups = []
+    for m in model.layers:
+        if isinstance(m, ConvGroup):
+            groups.append(m)
+    
+    if len(groups) != 3:
+        print(f"Warning: Expected 3 ConvGroups, found {len(groups)}")
+    
+    for i, group in enumerate(groups):
+        # group.conv1 and group.conv2
+        # Verify conv1.weight exists
+        if hasattr(group.conv1, 'weight'):
+            layers.append((f"Group{i+1}_Conv1", [group.conv1.weight]))
+        if hasattr(group.conv2, 'weight'):
+            layers.append((f"Group{i+1}_Conv2", [group.conv2.weight]))
+            
+    return layers
+
+def check_model_integrity(model):
+    """Checks if model weights have exploded to NaN/Inf."""
+    for name, param in model.named_parameters():
+        if torch.isnan(param).any() or torch.isinf(param).any():
+            print(f"   [WARNING] Model weights corrupted (NaN/Inf) at layer: {name}")
+            return False
+    return True
+
+def get_experiment_args(run_path: str) -> argparse.Namespace:
+    """Returns the experiment parameters after completing a run."""
+    config_path = os.path.join(run_path, "experimental_config.json")
+    if not os.path.exists(config_path):
+        raise ValueError(f"Path with experiment configs does not exist: {config_path}")
+        
+    with open(config_path, "r") as f:
+        config = json.load(f)
+        
+    return argparse.Namespace(**config)

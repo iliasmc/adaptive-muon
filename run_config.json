@@ -1,0 +1,17 @@
+{
+    "block1": 24,
+    "block2": 48,
+    "block3": 48,
+    "batch_size": 512,
+    "val_split": 0.1,
+    "whitening": true,
+    "num_epochs": 100,
+    "bias_lr": 0.01,
+    "head_lr": 0.6,
+    "conv_optimizer": ["sgd", "muon"],
+    "conv_lr": [0.03, 0.01],
+    "conv_momentum": 0.85,
+    "scheduler": "cosine",
+    "sgd_momentum": 0.85,
+    "results_root": "."
+}

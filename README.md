@@ -2,54 +2,12 @@
 
 This repo contains the code for the project in the Deep Learning project at ETH Zurich. Our project proposal is [here](docs/our_project_proposal.pdf).
 
-[![Code Quality](https://github.com/iliasmc/adaptive-muon/actions/workflows/code-quality.yml/badge.svg)](https://github.com/iliasmc/adaptive-muon/actions/workflows/code-quality.yml)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
 
 ## Overview
 
 We want to investigate using an adaptive version of Muon, to preserve its benefits in performance and accuracy while minimizing the compuational cost. We also investigate the effect of Muon on the Hessian of the loss landscape.
 
-## Quick Start
-
-### Training model
-`python -m src.train_model`
-
-### Installation
-
-#### Option 1: Using Conda (Recommended)
-
-Conda provides better dependency management and includes optimized PyTorch builds.
-
-1. Clone the repository:
-```bash
-git clone https://github.com/iliasmc/adaptive-muon.git
-cd adaptive-muon
-```
-
-2. Create and activate the conda environment:
-
-**For GPU (CUDA 11.8):**
-```bash
-conda env create -f environment.yml
-conda activate adaptive-muon
-```
-
-**For CPU-only:**
-```bash
-conda env create -f environment-cpu.yml
-conda activate adaptive-muon-cpu
-```
-
-**Note:** Edit `environment.yml` to change CUDA version:
-- For CUDA 12.1: `pytorch-cuda=12.1`
-- For CPU-only: `cpuonly`
-
-3. Install pre-commit hooks:
-```bash
-pre-commit install
-```
-
-#### Option 2: Using pip and venv
+## Installation
 
 1. Clone the repository:
 ```bash
@@ -65,83 +23,43 @@ source venv/bin/activate  # On Windows: venv\Scripts\activate
 
 3. Install development dependencies:
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 ```
 
-4. Install pre-commit hooks:
-```bash
-pre-commit install
+## Running experiments
+To run a series of experiments, set the experimental configs in `run_config.json` as seen below. In this case, it takes the cartesian product / all possible combinations of the specified params and runs and experiment for each combination. For instance the setup below will run 4 experiments.
+```python
+{
+    "block1": 24,
+    "block2": 48,
+    "block3": 48,
+    "batch_size": 512,
+    "val_split": 0.1,
+    "whitening": true,
+    "num_epochs": 100,
+    "bias_lr": 0.01,
+    "head_lr": 0.6,
+    "conv_optimizer": ["muon", "sgd"],
+    "conv_lr": [0.01, 0.03],
+    "conv_momentum": 0.85,
+    "scheduler": "cosine",
+    "sgd_momentum": 0.85,
+    "results_root": "."
+}
 ```
+
+Then, run `python -m src.launcher` to run the expriments provided in `run_config.json`. After running, you can see the results on https://wandb.ai/adaptive-muon, under `cnn-training` for logs related to training and `hessian-metrics` for logs related to the hessian statistics. While all needed results should be hosted on WANDB now, you will also get additional results in the `results_root` directory that you specified in `run_config.json` (by default it will be in the directory of adaptive-muon). In the local results, the model_weights are stored as well as a plot for the accuracy and a plot for the hessian metric results.
+
+Make sure to cleanup the results under `results_root` from time to time to avoid cluttering and going over the 20gb space limit.
+
+To run experiments as a slurm job, you can call the following, adjusting the GPU time (max time is 24hr I think). One full experiment run takes about 10min for training + 40min for hessian stats = 50mins, so keep that in mind. Doing hyperaparamter optimization will be easy and fast, but studing hessian metrics will be a bottleneck.
+
+```batch
+sbatch --time=04:00:00 --mem-per-cpu=10000 -A deep_learning --wrap="python -m src.launcher"
+```
+
 
 ## Code Quality Tools
-
-### 1. Black (Code Formatter)
-Black automatically formats Python code to a consistent style.
-
-```bash
-# Format all files
-black .
-
-# Check without modifying
-black --check .
-```
-
-**Configuration**: `pyproject.toml` - Line length: 100 characters
-
-### 2. isort (Import Sorter)
-Automatically sorts and organizes imports.
-
-```bash
-# Sort imports
-isort .
-
-# Check only
-isort --check-only .
-```
-
-**Configuration**: `pyproject.toml` - Compatible with Black
-
-### 3. Flake8 (Linter)
-Checks code for style violations and potential errors.
-
-```bash
-flake8 .
-```
-
-**Configuration**: `.flake8` - Max line length: 100, ignores Black conflicts
-
-### 4. Pylint (Advanced Linter)
-Provides comprehensive code analysis.
-
-```bash
-pylint src/
-```
-
-**Configuration**: `pyproject.toml` - Customized for PyTorch projects
-
-### 5. MyPy (Type Checker)
-Performs static type checking.
-
-```bash
-mypy src/
-```
-
-**Configuration**: `pyproject.toml` - Configured for PyTorch compatibility
-
-### 6. Pre-commit Hooks
-Automatically runs checks before each commit.
-
-```bash
-# Run on all files manually
-pre-commit run --all-files
-
-# Update hook versions
-pre-commit autoupdate
-```
-
-**Configuration**: `.pre-commit-config.yaml`
-
-## Running All Checks
 
 ```bash
 # Format code
