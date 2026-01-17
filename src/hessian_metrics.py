@@ -8,12 +8,13 @@ import sys
 from tqdm import tqdm
 import argparse
 import wandb
+import numpy as np
 
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
 from curvlinops import HessianLinearOperator, hutchinson_squared_fro, hutchinson_trace
 from scipy.sparse.linalg import eigsh
+from scipy.stats import entropy
 
 from src.utils import check_model_integrity, get_conv_layers, get_experiment_args
 
@@ -35,7 +36,23 @@ else:
 #############################################
 #           Core Hessian Metric Logic       #
 #############################################
-def analyze_layer_hessian(model, layer_name, layer_params, batch, num_eigenvalues=1, num_trace_vecs=100):
+def approximate_effective_rank(eigenvalues, k=100):
+    """
+    Estimates effective rank using the top 'k' singular values.
+    k should be large enough to capture the 'energy' of the matrix.
+    """
+    s_norm = eigenvalues / np.sum(eigenvalues)
+
+    #Calculate Shannon Entropy
+    #H = -sum(p * log(p))
+    ent = entropy(s_norm)
+
+    #Effective Rank is the exponential of the entropy
+    eff_rank = np.exp(ent)
+
+    return eff_rank
+
+def analyze_layer_hessian(model, layer_name, layer_params, batch, num_eigenvalues=100, num_trace_vecs=100):
     """
     Computes metrics for a specific layer (or globally, for all layers combined)
     """
@@ -61,6 +78,7 @@ def analyze_layer_hessian(model, layer_name, layer_params, batch, num_eigenvalue
     # 2. Compute Top Eigenvalues (Spectral Norm)
     H_scipy = H_op.to_scipy()
 
+    eigenvalues = np.array([])
     try:
         eigenvalues, _ = eigsh(H_scipy, k=num_eigenvalues, which="LM", tol=1e-4)
         eigenvalues = np.sort(np.abs(eigenvalues))[::-1]
@@ -82,10 +100,6 @@ def analyze_layer_hessian(model, layer_name, layer_params, batch, num_eigenvalue
     )
     frob_sq = frob_sq_tensor.item()
 
-    # Cleanup
-    del H_op
-    del H_scipy
-
     # Rank Metrics
     # Metric 1: Stable Rank
     # Interpretation: "How many directions are as sharp as the max direction?"
@@ -95,7 +109,12 @@ def analyze_layer_hessian(model, layer_name, layer_params, batch, num_eigenvalue
     # Metric 2: Effective Rank (Trace-based)
     # Interpretation: "Effective dimensionality of the curvature."
     # usually yields higher, more informative numbers for "flatness".
-    effective_rank = (trace_est**2) / (frob_sq + 1e-12)
+    # effective_rank = (trace_est**2) / (frob_sq + 1e-12)
+    effective_rank = approximate_effective_rank(eigenvalues)
+
+    # Cleanup
+    del H_op
+    del H_scipy
 
     return {
         "sharpness": lambda_max, 
@@ -145,13 +164,13 @@ def _compute_epoch_metrics(model, fixed_batch):
 
     # Global Hessian analysis
     # TODO: issue with trace and stable rank approaching inf for some reason -> perhaps mps issue
-    filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
-    if filter_params:
-        metrics = analyze_layer_hessian(
-            model, "global", filter_params, fixed_batch
-        )
-        print(f"     -> Sharpness: {metrics['sharpness']:.4f}, Trace: {metrics['trace']:.4f}, Stable Rank: {metrics['stable_rank']:.4f}, Effective Rank: {metrics['effective_rank']:.4f}")
-        epoch_data["global"] = metrics
+    # filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
+    # if filter_params:
+    #     metrics = analyze_layer_hessian(
+    #         model, "global", filter_params, fixed_batch
+    #     )
+    #     print(f"     -> Sharpness: {metrics['sharpness']:.4f}, Trace: {metrics['trace']:.4f}, Stable Rank: {metrics['stable_rank']:.4f}, Effective Rank: {metrics['effective_rank']:.4f}")
+    #     epoch_data["global"] = metrics
 
     return epoch_data
 
