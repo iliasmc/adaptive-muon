@@ -6,38 +6,39 @@ The main file for running experiments. Adjusted from https://github.com/KellerJo
 #                  Setup                    #
 #############################################
 
-import os
-import argparse 
+import argparse
 import json
-import wandb
-
+import os
 import time
+from datetime import datetime
 from math import ceil, cos, pi
-from tqdm import tqdm
 
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-import torchvision
-import torchvision.transforms as T
-from torch import nn
-from datetime import datetime
+from tqdm import tqdm
 
-from .muon_original import Muon
+import wandb
+from src.data_loader import CifarLoader
+from src.model import CifarNet
+from src.utils import str2bool
+
+from src.muon_original import Muon
 
 #############################################
 #           Parse experiment params         #
 #############################################
+
 parser = argparse.ArgumentParser(description="Adaptive Muon CNN Training Runner")
 # High level args
 parser.add_argument("--timestamp", type=str, default=None, help="Timestamp for the run (overrides auto-generation)")
-parser.add_argument("--wandb", action=argparse.BooleanOptionalAction, default=True, help="Whether to store results in WANDB")
+parser.add_argument("--wandb", type=str2bool, default=True, help="Whether to store results in WANDB")
 
 # CNN architecture params
 parser.add_argument("--block1", type=int, default=24, help="Width of CNN block 1")
 parser.add_argument("--block2", type=int, default=48, help="Width of CNN block 2")
 parser.add_argument("--block3", type=int, default=48, help="Width of CNN block 3")
-parser.add_argument("--whitening", action=argparse.BooleanOptionalAction, default=True, help="Whether to apply whitening")
+parser.add_argument("--whitening", type=str2bool, default=True, help="Whether to apply whitening")
 
 # Dataset/batch size
 parser.add_argument("--batch_size", type=int, default=512, help="Batch size for training")
@@ -98,294 +99,6 @@ else:
     device = torch.device("cpu")
 
 
-#############################################
-#                DataLoader                 #
-#############################################
-
-CIFAR_MEAN = torch.tensor((0.4914, 0.4822, 0.4465)).to(device)
-CIFAR_STD = torch.tensor((0.2470, 0.2435, 0.2616)).to(device)
-
-
-def batch_flip_lr(inputs):
-    flip_mask = (torch.rand(len(inputs), device=inputs.device) < 0.5).view(-1, 1, 1, 1)
-    return torch.where(flip_mask, inputs.flip(-1), inputs)
-
-
-def batch_crop(images, crop_size):
-    r = (images.size(-1) - crop_size) // 2
-    shifts = torch.randint(-r, r + 1, size=(len(images), 2), device=images.device)
-    images_out = torch.empty(
-        (len(images), 3, crop_size, crop_size), device=images.device, dtype=images.dtype
-    )
-    # The two cropping methods in this if-else produce equivalent results, but the second is faster for r > 2.
-    if r <= 2:
-        for sy in range(-r, r + 1):
-            for sx in range(-r, r + 1):
-                mask = (shifts[:, 0] == sy) & (shifts[:, 1] == sx)
-                images_out[mask] = images[
-                    mask, :, r + sy : r + sy + crop_size, r + sx : r + sx + crop_size
-                ]
-    else:
-        images_tmp = torch.empty(
-            (len(images), 3, crop_size, crop_size + 2 * r), device=images.device, dtype=images.dtype
-        )
-        for s in range(-r, r + 1):
-            mask = shifts[:, 0] == s
-            images_tmp[mask] = images[mask, :, r + s : r + s + crop_size, :]
-        for s in range(-r, r + 1):
-            mask = shifts[:, 1] == s
-            images_out[mask] = images_tmp[mask, :, :, r + s : r + s + crop_size]
-    return images_out
-
-
-class CifarLoader:
-    def __init__(self, path, train=True, batch_size=500, aug=None, val_split=0.0, part="train"):
-        data_path = os.path.join(path, "train.pt" if train else "test.pt")
-        if not os.path.exists(data_path):
-            dset = torchvision.datasets.CIFAR10(path, download=True, train=train)
-            images = torch.tensor(dset.data)
-            labels = torch.tensor(dset.targets)
-
-            # Reshuffle the loaded data
-            indices = torch.randperm(images.size(0))
-            images = images[indices]
-            labels = labels[indices]
-
-            torch.save({"images": images, "labels": labels, "classes": dset.classes}, data_path)
-
-        data = torch.load(data_path, map_location=device)
-        self.images, self.labels, self.classes = data["images"], data["labels"], data["classes"]
-
-        if train:
-            assert 0.0 <= val_split < 1.0, "val_split must be between 0 and 1"
-            num_val = int(len(self.images) * val_split)
-            num_train = len(self.images) - num_val
-            if part == "train":
-                self.images = self.images[:num_train]
-                self.labels = self.labels[:num_train]
-            elif part == "val":
-                self.images = self.images[num_train:]
-                self.labels = self.labels[num_train:]
-            else:
-                raise ValueError(f"Invalid part '{part}'")
-
-        # It's faster to load+process uint8 data than to load preprocessed fp16 data
-        self.images = (
-            (self.images.float() / 255).permute(0, 3, 1, 2).to(memory_format=torch.channels_last)
-        )
-
-        self.normalize = T.Normalize(CIFAR_MEAN, CIFAR_STD)
-        self.proc_images = {}  # Saved results of image processing to be done on the first epoch
-        self.epoch = 0
-
-        self.aug = aug or {}
-        for k in self.aug.keys():
-            assert k in ["flip", "translate"], "Unrecognized key: %s" % k
-
-        self.batch_size = batch_size
-        self.drop_last = train
-        self.shuffle = train
-
-    def __len__(self):
-        return (
-            len(self.images) // self.batch_size
-            if self.drop_last
-            else ceil(len(self.images) / self.batch_size)
-        )
-
-    def __iter__(self):
-        if self.epoch == 0:
-            images = self.proc_images["norm"] = self.normalize(self.images)
-            # Pre-flip images in order to do every-other epoch flipping scheme
-            if self.aug.get("flip", False):
-                images = self.proc_images["flip"] = batch_flip_lr(images)
-            # Pre-pad images to save time when doing random translation
-            pad = self.aug.get("translate", 0)
-            if pad > 0:
-                self.proc_images["pad"] = F.pad(images, (pad,) * 4, "reflect")
-
-        if self.aug.get("translate", 0) > 0:
-            images = batch_crop(self.proc_images["pad"], self.images.shape[-2])
-        elif self.aug.get("flip", False):
-            images = self.proc_images["flip"]
-        else:
-            images = self.proc_images["norm"]
-        # Flip all images together every other epoch. This increases diversity relative to random flipping
-        if self.aug.get("flip", False):
-            if self.epoch % 2 == 1:
-                images = images.flip(-1)
-
-        self.epoch += 1
-
-        indices = (torch.randperm if self.shuffle else torch.arange)(
-            len(images), device=images.device
-        )
-        for i in range(len(self)):
-            idxs = indices[i * self.batch_size : (i + 1) * self.batch_size]
-            yield (images[idxs], self.labels[idxs])
-
-
-#############################################
-#            Network Definition             #
-#############################################
-
-
-# note the use of low BatchNorm stats momentum
-class BatchNorm(nn.BatchNorm2d):
-    def __init__(self, num_features, momentum=0.6, eps=1e-12):
-        super().__init__(num_features, eps=eps, momentum=1 - momentum)
-        self.weight.requires_grad = False
-        # Note that PyTorch already initializes the weights to one and bias to zero
-
-
-class Conv(nn.Conv2d):
-    def __init__(self, in_channels, out_channels):
-        super().__init__(in_channels, out_channels, kernel_size=3, padding="same", bias=False)
-
-    def reset_parameters(self):
-        super().reset_parameters()
-        w = self.weight.data
-        torch.nn.init.dirac_(w[: w.size(1)])
-
-
-class ConvGroup(nn.Module):
-    def __init__(self, channels_in, channels_out):
-        super().__init__()
-        self.conv1 = Conv(channels_in, channels_out)
-        self.pool = nn.MaxPool2d(2, return_indices=True)
-        self.norm1 = BatchNorm(channels_out)
-        self.conv2 = Conv(channels_out, channels_out)
-        self.norm2 = BatchNorm(channels_out)
-        self.activ = nn.GELU()
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.pool(x)
-        if isinstance(x, tuple):
-            x = x[0]
-        x = self.norm1(x)
-        x = self.activ(x)
-        x = self.conv2(x)
-        x = self.norm2(x)
-        x = self.activ(x)
-        return x
-
-
-class CifarNet(nn.Module):
-    def __init__(self, block1:int, block2:int, block3:int, apply_whitening:bool):
-        super().__init__()
-        self.apply_whitening = apply_whitening
-        widths = dict(block1=block1, block2=block2, block3=block3)
-        if self.apply_whitening:
-            whiten_kernel_size = 2
-            whiten_width = 2 * 3 * whiten_kernel_size**2
-            self.whiten = nn.Conv2d(3, whiten_width, whiten_kernel_size, padding=0, bias=True)
-            self.whiten.weight.requires_grad = False
-            self.layers = nn.Sequential(
-                nn.GELU(),
-                ConvGroup(whiten_width, widths["block1"]),
-                ConvGroup(widths["block1"], widths["block2"]),
-                ConvGroup(widths["block2"], widths["block3"]),
-                nn.MaxPool2d(3, return_indices=True),
-            )
-        else:
-            self.layers = nn.Sequential(
-                nn.GELU(),
-                ConvGroup(3, widths["block1"]),
-                ConvGroup(widths["block1"], widths["block2"]),
-                ConvGroup(widths["block2"], widths["block3"]),
-                nn.MaxPool2d(3, return_indices=True),
-            )
-        self.head = nn.Linear(widths["block3"], 10, bias=False)
-        for mod in self.modules():
-            if isinstance(mod, BatchNorm):
-                mod.float()
-            else:
-                mod.float()
-
-    def reset(self):
-        for m in self.modules():
-            if type(m) in (nn.Conv2d, Conv, BatchNorm, nn.Linear):
-                m.reset_parameters()
-        w = self.head.weight.data
-        w *= 1 / w.std()
-
-    def init_whiten(self, train_images, eps=5e-4):
-        c, (h, w) = train_images.shape[1], self.whiten.weight.shape[2:]
-        patches = (
-            train_images.unfold(2, h, 1)
-            .unfold(3, w, 1)
-            .transpose(1, 3)
-            .reshape(-1, c, h, w)
-            .float()
-        )
-        patches_flat = patches.view(len(patches), -1)
-        est_patch_covariance = (patches_flat.T @ patches_flat) / len(patches_flat)
-        
-        # FIX: Move to CPU for eigenvalue decomposition (not supported on MPS)
-        # We store the original device to move results back later
-        orig_device = est_patch_covariance.device
-        cov_cpu = est_patch_covariance.cpu()
-        
-        eigenvalues, eigenvectors = torch.linalg.eigh(cov_cpu, UPLO="U")
-        
-        # Move results back to the original device (MPS or CUDA)
-        eigenvalues = eigenvalues.to(orig_device)
-        eigenvectors = eigenvectors.to(orig_device)
-        
-        eigenvectors_scaled = eigenvectors.T.reshape(-1, c, h, w) / torch.sqrt(
-            eigenvalues.view(-1, 1, 1, 1) + eps
-        )
-        self.whiten.weight.data[:] = torch.cat((eigenvectors_scaled, -eigenvectors_scaled))
-    
-    
-    def forward(self, x, whiten_bias_grad=True):
-        b = self.whiten.bias
-        if self.apply_whitening:
-            x = F.conv2d(x, self.whiten.weight, b if whiten_bias_grad else b.detach())
-        x = self.layers(x)
-        # Unpack tuple if return_indices=True was used in MaxPool2d
-        if isinstance(x, tuple):
-            x = x[0]
-        x = x.reshape(len(x), -1)
-        return self.head(x) / x.size(-1)
-
-
-############################################
-#                 Logging                  #
-############################################
-
-
-def print_columns(columns_list, is_head=False, is_final_entry=False):
-    print_string = ""
-    for col in columns_list:
-        print_string += "|  %s  " % col
-    print_string += "|"
-    if is_head:
-        print("-" * len(print_string))
-    print(print_string)
-    if is_head or is_final_entry:
-        print("-" * len(print_string))
-
-
-logging_columns_list = ["run   ", "epoch", "train_acc", "val_acc", "test_acc", "time_seconds"]
-
-
-def print_training_details(variables, is_final_entry):
-    formatted = []
-    for col in logging_columns_list:
-        var = variables.get(col.strip(), None)
-        if type(var) in (int, str):
-            res = str(var)
-        elif type(var) is float:
-            res = "{:0.4f}".format(var)
-        else:
-            assert var is None
-            res = ""
-        formatted.append(res.rjust(len(col)))
-    print_columns(formatted, is_final_entry=is_final_entry)
-
-
 ############################################
 #               Evaluation                 #
 ############################################
@@ -432,33 +145,29 @@ def evaluate(model, loader, tta_level=0):
     return (logits.argmax(1) == loader.labels).float().mean().item()
 
 
-############################################
-#                Training                  #
-############################################
-
-
-def main(run, model):
-    batch_size = args.batch_size
-    bias_lr = args.bias_lr #0.053
-    head_lr = args.head_lr #0.67
+def main(run, model, config, device, is_sweep=False):
+    batch_size = config.batch_size
+    bias_lr = config.bias_lr #0.053
+    head_lr = config.head_lr #0.67
     wd = 2e-6 * batch_size
 
     # Use a specific split for validation (e.g., 20% of the training data)
-    val_split = args.val_split
+    val_split = config.val_split
 
-    test_loader = CifarLoader("cifar10", train=False, batch_size=2000)
+    test_loader = CifarLoader("cifar10", device=device, train=False, batch_size=2000)
     val_loader = CifarLoader(
-        "cifar10", train=True, batch_size=2000, val_split=val_split, part="val"
+        "cifar10", device=device, train=True, batch_size=2000, val_split=val_split, part="val"
     )
     train_loader = CifarLoader(
         "cifar10",
+        device=device,
         train=True,
         batch_size=batch_size,
         aug=dict(flip=True, translate=4),
         val_split=val_split,
         part="train",
     )
-    num_epochs = args.num_epochs
+    num_epochs = config.num_epochs
 
     if run == "warmup":
         # The only purpose of the first run is to warmup the compiled model, so we can use dummy data
@@ -481,29 +190,17 @@ def main(run, model):
     ]
     # Use fused optimizer only on CUDA
     use_fused = torch.cuda.is_available()
-    optimizer1 = torch.optim.SGD(param_configs, momentum=args.sgd_momentum, nesterov=True, fused=use_fused)
-    if args.conv_optimizer == "muon":
-        optimizer2 = Muon(filter_params, lr=args.conv_lr, momentum=args.conv_momentum, nesterov=True)
-    elif args.conv_optimizer == "sgd":
-        optimizer2 = torch.optim.SGD(filter_params, lr=args.conv_lr, momentum=args.conv_momentum, nesterov=True, weight_decay=wd/args.conv_lr, fused=use_fused)
+    optimizer1 = torch.optim.SGD(param_configs, momentum=config.sgd_momentum, nesterov=True, fused=use_fused)
+    if config.conv_optimizer == "muon":
+        optimizer2 = Muon(filter_params, lr=config.conv_lr, momentum=config.conv_momentum, nesterov=True)
+    elif config.conv_optimizer == "sgd":
+        optimizer2 = torch.optim.SGD(filter_params, lr=config.conv_lr, momentum=config.conv_momentum, nesterov=True, weight_decay=wd/config.conv_lr, fused=use_fused)
     else:
         raise NotImplementedError("Need to put our adaptive muon optimizer here")
     optimizers = [optimizer1, optimizer2]
     for opt in optimizers:
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
-
-    # For accurately timing GPU code
-    # starter = torch.cuda.Event(enable_timing=True)
-    # ender = torch.cuda.Event(enable_timing=True)
-    # time_seconds = 0.0
-    # def start_timer():
-    #     starter.record()
-    # def stop_timer():
-    #     ender.record()
-    #     torch.cuda.synchronize()
-    #     nonlocal time_seconds
-    #     time_seconds += 1e-3 * starter.elapsed_time(ender)
 
     model.reset()
     step = 0
@@ -512,11 +209,9 @@ def main(run, model):
     test_accs = []
 
     # Initialize the whitening layer using training images
-    # start_timer()
-    if args.whitening:
+    if config.whitening:
         train_images = train_loader.normalize(train_loader.images[:5000])
         model.init_whiten(train_images)
-    # stop_timer()
 
     for epoch in tqdm(range(ceil(total_train_steps / len(train_loader)))):
         print(f"At epoch: {epoch}")
@@ -528,7 +223,6 @@ def main(run, model):
         #     Training     #
         ####################
 
-        # start_timer()
         model.train()
         epoch_train_loss = 0.0
         for inputs, labels in train_loader:
@@ -543,7 +237,7 @@ def main(run, model):
                 group["lr"] = group["initial_lr"] * (1 - step / whiten_bias_train_steps)
             # The LR for the rest of the params
             for group in optimizer1.param_groups[1:] + optimizer2.param_groups:
-                if args.scheduler == "cosine":
+                if config.scheduler == "cosine":
                     decay = 0.5 * (1 + cos(pi * (step / total_train_steps)))
                 else: # linear
                     decay = (1 - step / total_train_steps)
@@ -560,17 +254,15 @@ def main(run, model):
         epoch_duration = epoch_end_time - epoch_start_time
         print(f"Epoch {epoch} completed in {epoch_duration:.4f} seconds")
 
-        # Store model weights
         # Save model weights after each epoch into the model_weights/ directory
-        try:
-            os.makedirs(f"{args.results_root}/{timestamp}/model_weights", exist_ok=True)
-            weight_path = os.path.join(args.results_root, timestamp, "model_weights", f"model_epoch_{epoch}.pt")
-            torch.save({"epoch": epoch, "state_dict": model.state_dict()}, weight_path)
-            print(f"Saved model weights to {os.path.abspath(weight_path)}")
-        except Exception as e:
-            print(f"Warning: failed to save model weights for epoch {epoch}: {e}")
-
-        # stop_timer()
+        if not is_sweep:
+            try:
+                os.makedirs(f"{config.results_root}/{timestamp}/model_weights", exist_ok=True)
+                weight_path = os.path.join(config.results_root, timestamp, "model_weights", f"model_epoch_{epoch}.pt")
+                torch.save({"epoch": epoch, "state_dict": model.state_dict()}, weight_path)
+                print(f"Saved model weights to {os.path.abspath(weight_path)}")
+            except Exception as e:
+                print(f"Warning: failed to save model weights for epoch {epoch}: {e}")
 
         ####################
         #    Evaluation    #
@@ -625,67 +317,65 @@ def main(run, model):
             "epoch_duration": epoch_duration
         })
 
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(len(train_accs)), train_accs, marker="s", linestyle="--", color="orange", label="Training Accuracy")
-    plt.plot(range(len(test_accs)), test_accs, marker="o", linestyle="-", color="blue", label="Test Accuracy")
-    plt.xlabel("Epoch")
-    plt.ylabel("Accuracy")
-    plt.title("Training vs. Test Accuracy over Epochs")
-    plt.legend()
-    plt.grid(True)
-    plt.savefig(f"{args.results_root}/{timestamp}/accuracy_comparison.png", dpi=150, bbox_inches="tight")
-    plt.close()
-
-    ####################
-    #  TTA Evaluation  #
-    ####################
-
-    # start_timer()
-    test_acc = evaluate(model, test_loader, tta_level=2)
-    # stop_timer()
-    epoch_label = "eval"
-    print_training_details({**locals(), "epoch": epoch_label}, is_final_entry=True)
+    if not is_sweep:
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(len(train_accs)), train_accs, marker="s", linestyle="--", color="orange", label="Training Accuracy")
+        plt.plot(range(len(test_accs)), test_accs, marker="o", linestyle="-", color="blue", label="Test Accuracy")
+        plt.xlabel("Epoch")
+        plt.ylabel("Accuracy")
+        plt.title("Training vs. Test Accuracy over Epochs")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(f"{config.results_root}/{timestamp}/accuracy_comparison.png", dpi=150, bbox_inches="tight")
+        plt.close()
 
     # Calculate and print total training time
     total_end_time = time.time()
     total_training_time = total_end_time - total_start_time
     print(f"Total training time: {total_training_time:.4f} seconds")
 
-    return test_acc
 
 
 if __name__ == "__main__":
-    ### Store experimental dict
+    # Find whether we are in a sweep
+    is_sweep = "WANDB_SWEEP_ID" in os.environ
+    print(f"Is sweep: {is_sweep}")
+
     config_dict = vars(args)
     config_dict['timestamp'] = timestamp
     config_dict['run_name'] = args.run_name if args.run_name != "" else run_name
-    print("\n--- Running Experiment with Configuration ---")
-    print(json.dumps(config_dict, indent=4))
-    print("--------------------------------------------\n")
-    output_dir = os.path.join(args.results_root, timestamp)
-    os.makedirs(output_dir, exist_ok=True)
-    config_path = os.path.join(output_dir, "experimental_config.json")
-    with open(config_path, "w") as f:
-        json.dump(config_dict, f, indent=4)
 
-    ## Setup WandB for tracking experiments ##
+    # Store config
+    if not is_sweep:
+        print("\n--- Running Experiment with Configuration ---")
+        print(json.dumps(config_dict, indent=4))
+        print("--------------------------------------------\n")
+        output_dir = os.path.join(args.results_root, timestamp)
+        os.makedirs(output_dir, exist_ok=True)
+        config_path = os.path.join(output_dir, "experimental_config.json")
+        with open(config_path, "w") as f:
+            json.dump(config_dict, f, indent=4)
+
+    # Setup WandB for tracking experiments
     wandb.init(
         entity="adaptive-muon",
         project="cnn-training", 
-        config=config_dict,
+        # config=config_dict,
         name=config_dict['run_name'],
-        mode="disabled" if not args.wandb else "online"
+        mode="disabled" if not config_dict["wandb"] else "online"
     )
-    ### Training code ###
-    model = CifarNet(block1=args.block1,
-                     block2=args.block2,
-                     block3=args.block3,
-                     apply_whitening=args.whitening).to(device)
+    wandb.config.update(config_dict, allow_val_change=True)
+    config = wandb.config
+    # Training code
+    model = CifarNet(block1=config.block1,
+                     block2=config.block2,
+                     block3=config.block3,
+                     apply_whitening=config.whitening).to(device)
     print(model)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params}")
 
-    # Only compile on CUDA systems
+    # Only compile on CUDA systems (fix on cluster)
     if torch.cuda.is_available():
         major, minor = torch.cuda.get_device_capability()
         if major >= 7:
@@ -696,10 +386,11 @@ if __name__ == "__main__":
         print(
             "Warning: Running without torch.compile (CUDA not available). Performance will be significantly slower."
         )
-    print("About to print columns")
 
-    print_columns(logging_columns_list, is_head=True)
-    # main("warmup", model)
-    accs = torch.tensor([main(run, model) for run in range(1)])
-    # print("Mean: %.4f    Std: %.4f" % (accs.mean(), accs.std()))
+    # main("warmup", model, config, device, is_sweep)
+    main(run=0, 
+         model=model, 
+         config=config, 
+         device=device, 
+         is_sweep=is_sweep)
     wandb.finish()

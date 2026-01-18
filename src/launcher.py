@@ -1,10 +1,10 @@
-import json
-import subprocess
 import itertools
-from pathlib import Path
-import sys
+import json
 import os
+import subprocess
+import sys
 from datetime import datetime
+
 
 def run_experiments(config_path):
     # 1. Load the configuration

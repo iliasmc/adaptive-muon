@@ -1,25 +1,23 @@
 """
 Script to extract approximate loss Hessian metrics per layer, but also globally.
 """
+import argparse
 import gc
 import os
-import time
-import sys
-from tqdm import tqdm
-import argparse
-import wandb
-import numpy as np
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 from curvlinops import HessianLinearOperator, hutchinson_squared_fro, hutchinson_trace
 from scipy.sparse.linalg import eigsh
 from scipy.stats import entropy
+from tqdm import tqdm
 
+import wandb
 from src.utils import check_model_integrity, get_conv_layers, get_experiment_args
 
-from .train_model import CifarLoader, CifarNet
-
+from src.data_loader import CifarLoader
+from src.model import CifarNet
 
 #############################################
 #             Select PyTorch device         #
@@ -164,13 +162,13 @@ def _compute_epoch_metrics(model, fixed_batch):
 
     # Global Hessian analysis
     # TODO: issue with trace and stable rank approaching inf for some reason -> perhaps mps issue
-    # filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
-    # if filter_params:
-    #     metrics = analyze_layer_hessian(
-    #         model, "global", filter_params, fixed_batch
-    #     )
-    #     print(f"     -> Sharpness: {metrics['sharpness']:.4f}, Trace: {metrics['trace']:.4f}, Stable Rank: {metrics['stable_rank']:.4f}, Effective Rank: {metrics['effective_rank']:.4f}")
-    #     epoch_data["global"] = metrics
+    filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
+    if filter_params:
+        metrics = analyze_layer_hessian(
+            model, "global", filter_params, fixed_batch
+        )
+        print(f"     -> Sharpness: {metrics['sharpness']:.4f}, Trace: {metrics['trace']:.4f}, Stable Rank: {metrics['stable_rank']:.4f}, Effective Rank: {metrics['effective_rank']:.4f}")
+        epoch_data["global"] = metrics
 
     return epoch_data
 
@@ -237,7 +235,7 @@ def run_hessian_analysis(run_path, batch_size, experiment_args):
 
     # Load Data 
     train_loader = CifarLoader(
-        "cifar10", train=True, batch_size=batch_size, aug=dict(flip=False, translate=0)
+        "cifar10", device=device, train=True, batch_size=batch_size, aug=dict(flip=False, translate=0)
     )
     fixed_inputs, fixed_targets = next(iter(train_loader))
     fixed_inputs = fixed_inputs.to(device=device).contiguous()

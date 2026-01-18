@@ -2,8 +2,8 @@
 The code for muon with probabilistic scheduler.
 """
 
-import torch
 import numpy as np
+import torch
 
 
 def zeropower_via_newtonschulz5(G, steps=3, eps=1e-7):

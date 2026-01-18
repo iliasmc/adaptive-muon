@@ -58,6 +58,18 @@ To run experiments as a slurm job, you can call the following, adjusting the GPU
 sbatch --time=04:00:00 --mem-per-cpu=10000 -A deep_learning --wrap="python -m src.launcher"
 ```
 
+## Hyperparamter tuning
+We used sweeps from Weights & Biases to tune our hyperparamters. You can run it with:
+
+``bash
+wandb sweep sweep_muon.yaml --project muon_sweep --entity adaptive-muon
+``
+
+This will return a `sweep_id` which you can then use to kick off a sweep with:
+
+``bash
+wandb agent adaptive-muon/muon_sweep/{sweep_id}
+``
 
 ## Code Quality Tools
 
