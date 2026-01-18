@@ -74,7 +74,7 @@ wandb agent adaptive-muon/muon_sweep/{sweep_id}
 If you want to do this on the cluster, you should create a new sweep locally (or on the login node) and then run this:
 
 ```bash
-sbatch --time=08:00:00 --mem-per-cpu=10000 -A deep_learning --wrap="wandb agent adaptive-muon/muon_sweep/{sweep_id}"
+sbatch --time=08:00:00 --mem-per-cpu=10000 -A deep_learning --wrap="wandb agent adaptive-muon/muon_sweep/{sweep_id} --count 1"
 ```
 
 

@@ -54,4 +54,4 @@ parameters:
   block1:
     value: 24
   wandb:
-    value: "false"
+    value: "true"
