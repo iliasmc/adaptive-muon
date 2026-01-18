@@ -67,7 +67,7 @@ class CifarNet(nn.Module):
             )
         else:
             self.layers = nn.Sequential(
-                nn.GELU(),
+                # nn.GELU(),
                 ConvGroup(3, widths["block1"]),
                 ConvGroup(widths["block1"], widths["block2"]),
                 ConvGroup(widths["block2"], widths["block3"]),
@@ -116,8 +116,8 @@ class CifarNet(nn.Module):
     
     
     def forward(self, x, whiten_bias_grad=True):
-        b = self.whiten.bias
         if self.apply_whitening:
+            b = self.whiten.bias
             x = F.conv2d(x, self.whiten.weight, b if whiten_bias_grad else b.detach())
         x = self.layers(x)
         # Unpack tuple if return_indices=True was used in MaxPool2d

@@ -238,10 +238,11 @@ def main(run, model, config, device, is_sweep=False):
             epoch_train_loss += ce_loss.item()
 
             # The LR for the whitening layer params
-            for group in optimizer1.param_groups[:1]:
-                group["lr"] = group["initial_lr"] * (1 - step / whiten_bias_train_steps)
+            if config.whitening:
+                whitening_group = optimizer1.param_groups[-1]
+                whitening_group["lr"] = whitening_group["initial_lr"] * (1 - step / whiten_bias_train_steps)
             # The LR for the rest of the params
-            for group in optimizer1.param_groups[1:] + optimizer2.param_groups:
+            for group in optimizer1.param_groups[:-1] + optimizer2.param_groups:
                 if config.scheduler == "cosine":
                     decay = 0.5 * (1 + cos(pi * (step / total_train_steps)))
                 else: # linear
