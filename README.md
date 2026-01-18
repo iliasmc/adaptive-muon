@@ -61,15 +61,22 @@ sbatch --time=04:00:00 --mem-per-cpu=10000 -A deep_learning --wrap="python -m sr
 ## Hyperparamter tuning
 We used sweeps from Weights & Biases to tune our hyperparamters. You can run it with:
 
-``bash
+```bash
 wandb sweep sweep_muon.yaml --project muon_sweep --entity adaptive-muon
-``
+```
 
 This will return a `sweep_id` which you can then use to kick off a sweep with:
 
-``bash
+```bash
 wandb agent adaptive-muon/muon_sweep/{sweep_id}
-``
+```
+
+If you want to do this on the cluster, you should create a new sweep locally (or on the login node) and then run this:
+
+```bash
+sbatch --time=08:00:00 --mem-per-cpu=10000 -A deep_learning --wrap="wandb agent adaptive-muon/muon_sweep/{sweep_id}"
+```
+
 
 ## Code Quality Tools
 
