@@ -88,4 +88,4 @@ if __name__ == "__main__":
     # Ensure these filenames match your actual files
     run_experiments("run_configs/muon_optimal_config.yaml")
     run_experiments("run_configs/sgd_optimal_config.yaml")
-    # run_experiments("run_configs/ablation_study_config.yaml")
+    run_experiments("run_configs/ablation_study_config.yaml")
