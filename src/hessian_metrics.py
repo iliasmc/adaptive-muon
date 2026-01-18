@@ -126,6 +126,7 @@ def analyze_layer_hessian(model, layer_name, layer_params, batch, num_eigenvalue
         "num_params": num_params,
         "normalized_stable_rank": stable_rank_spectral / num_params,
         "normalized_effective_rank": effective_rank / num_params,
+        "eigenvalues": eigenvalues.tolist() if isinstance(eigenvalues, np.ndarray) else list(eigenvalues)
     }
 
 
@@ -166,13 +167,13 @@ def _compute_epoch_metrics(model, fixed_batch):
 
     # Global Hessian analysis
     # TODO: issue with trace and stable rank approaching inf for some reason -> perhaps mps issue
-    filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
-    if filter_params:
-        metrics = analyze_layer_hessian(
-            model, "global", filter_params, fixed_batch
-        )
-        print(f"     -> Sharpness: {metrics['sharpness']:.4f}, Trace: {metrics['trace']:.4f}, Stable Rank: {metrics['stable_rank']:.4f}, Effective Rank: {metrics['effective_rank']:.4f}")
-        epoch_data["global"] = metrics
+    # filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
+    # if filter_params:
+    #     metrics = analyze_layer_hessian(
+    #         model, "global", filter_params, fixed_batch
+    #     )
+    #     print(f"     -> Sharpness: {metrics['sharpness']:.4f}, Trace: {metrics['trace']:.4f}, Stable Rank: {metrics['stable_rank']:.4f}, Effective Rank: {metrics['effective_rank']:.4f}")
+    #     epoch_data["global"] = metrics
 
     return epoch_data
 

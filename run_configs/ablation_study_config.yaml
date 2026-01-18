@@ -8,10 +8,12 @@
     "num_epochs": 100,
     "bias_lr": 0.09626634036544346,
     "head_lr": 0.4553903374138923,
-    "conv_optimizer": "sgd",
+    "conv_optimizer": "muon",
     "conv_lr": 0.025062557252420813,
     "conv_momentum": 0.4834786291425057,
     "scheduler": "cosine",
     "sgd_momentum": 0.0249397989097756,
     "results_root": ".",
+    "muon_orth": [true, false],
+    "muon_norm": [true, false],
 }

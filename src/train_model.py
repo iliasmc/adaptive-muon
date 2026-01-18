@@ -93,6 +93,8 @@ run_name = (
     f"sch-{args.scheduler},"
     f"smom-{args.sgd_momentum}"
 )
+if args.conv_optimizer == "muon":
+    run_name += f"orth:{args.muon_orth}, norm:{args.muon_normalize}"
 
 #############################################
 #             Select PyTorch device         #
