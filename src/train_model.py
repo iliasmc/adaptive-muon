@@ -59,6 +59,10 @@ parser.add_argument("--conv_momentum", type=float, default=0.85, help="Momentum 
 parser.add_argument("--scheduler", type=str, choices=["cosine", "linear"], default="cosine", help="LR scheduler type")
 parser.add_argument("--sgd_momentum", type=float, default=0.85, help="Momentum for SGD (optimizer1)")
 
+# Muon params (for the ablation study)
+parser.add_argument("--muon_orth", type=str2bool, default=True, help="Whether to apply orthogonalization inside Muon.")
+parser.add_argument("--muon_normalize", type=str2bool, default=True, help="Whether to apply layer-wise LR normalization inside Muon.")
+
 # Directory under which to store artifacts
 parser.add_argument("--results_root", type=str, default=".", help="Root directory to store results in")
 parser.add_argument("--run_name", type=str, default="", help="The name to store the run by in WANDB. If no value passed, a collection of all previous args will be used.")
@@ -206,7 +210,12 @@ def main(run, config, device, is_sweep=False):
     use_fused = torch.cuda.is_available()
     optimizer1 = torch.optim.SGD(param_configs, momentum=config.sgd_momentum, nesterov=True, fused=use_fused)
     if config.conv_optimizer == "muon":
-        optimizer2 = Muon(filter_params, lr=config.conv_lr, momentum=config.conv_momentum, nesterov=True)
+        optimizer2 = Muon(filter_params, 
+                          lr=config.conv_lr, 
+                          momentum=config.conv_momentum, 
+                          nesterov=True,
+                          orthogonalize=config.muon_orth,
+                          normalize=config.muon_normalize)
     elif config.conv_optimizer == "sgd":
         optimizer2 = torch.optim.SGD(filter_params, lr=config.conv_lr, momentum=config.conv_momentum, nesterov=True, weight_decay=wd/config.conv_lr, fused=use_fused)
     else:
