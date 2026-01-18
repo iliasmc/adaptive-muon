@@ -148,7 +148,7 @@ def evaluate(model, loader, tta_level=0):
     return (logits.argmax(1) == loader.labels).float().mean().item()
 
 
-def main(run, model, config, device, is_sweep=False):
+def main(run, config, device, is_sweep=False):
     batch_size = config.batch_size
     bias_lr = config.bias_lr #0.053
     head_lr = config.head_lr #0.67
@@ -170,6 +170,15 @@ def main(run, model, config, device, is_sweep=False):
         val_split=val_split,
         part="train",
     )
+
+    # Read model
+    model = CifarNet(block1=config.block1,
+                     block2=config.block2,
+                     block3=config.block3,
+                     apply_whitening=config.whitening).to(device)
+    print(model)
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {total_params}")
     num_epochs = config.num_epochs
 
     if run == "warmup":
@@ -372,30 +381,21 @@ if __name__ == "__main__":
     )
     wandb.config.update(config_dict, allow_val_change=True)
     config = wandb.config
-    # Training code
-    model = CifarNet(block1=config.block1,
-                     block2=config.block2,
-                     block3=config.block3,
-                     apply_whitening=config.whitening).to(device)
-    print(model)
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Total parameters: {total_params}")
 
     # Only compile on CUDA systems (fix on cluster)
-    if torch.cuda.is_available():
-        major, minor = torch.cuda.get_device_capability()
-        if major >= 7:
-            model.compile(mode="max-autotune")
-        else:
-            print(f"Warning: GPU capability {major}.{minor} < 7.0. Skipping torch.compile (Triton not supported).")
-    else:
-        print(
-            "Warning: Running without torch.compile (CUDA not available). Performance will be significantly slower."
-        )
+    # if torch.cuda.is_available():
+    #     major, minor = torch.cuda.get_device_capability()
+    #     if major >= 7:
+    #         model.compile(mode="max-autotune")
+    #     else:
+    #         print(f"Warning: GPU capability {major}.{minor} < 7.0. Skipping torch.compile (Triton not supported).")
+    # else:
+    #     print(
+    #         "Warning: Running without torch.compile (CUDA not available). Performance will be significantly slower."
+    #     )
 
-    # main("warmup", model, config, device, is_sweep)
+    # main("warmup", config, device, is_sweep)
     main(run=0, 
-         model=model, 
          config=config, 
          device=device, 
          is_sweep=is_sweep)

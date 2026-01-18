@@ -45,19 +45,12 @@ def run_experiments(config_path):
         cmd.append(ts)
 
         for key, value in current_params.items():
+            cmd.append(f"--{key}")
+            # All arguments in train_model.py now expect a value (e.g. type=str2bool),
+            # so we pass the value explicitly instead of using --flag/--no-flag.
             if isinstance(value, bool):
-                # Handle BooleanOptionalAction (specifically for whitening, but generic enough for flags)
-                if key == "whitening":
-                    if value:
-                        cmd.append(f"--{key}")
-                    else:
-                        cmd.append(f"--no-{key}")
-                else:
-                    # Fallback for other potential boolean args that might just need the value
-                    cmd.append(f"--{key}")
-                    cmd.append(str(value).lower())
+                cmd.append(str(value).lower())
             else:
-                cmd.append(f"--{key}")
                 cmd.append(str(value))
         
         print(f"\n>>> Running Experiment {i+1}/{len(combinations)}")
@@ -93,4 +86,5 @@ def run_experiments(config_path):
 
 if __name__ == "__main__":
     # Ensure these filenames match your actual files
-    run_experiments("run_config.json")
+    run_experiments("run_configs/muon_optimal_config.yaml")
+    run_experiments("run_configs/sgd_optimal_config.yaml")
