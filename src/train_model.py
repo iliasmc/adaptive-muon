@@ -19,6 +19,9 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 import wandb
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.data_loader import CifarLoader
 from src.model import CifarNet
 from src.utils import str2bool
@@ -184,10 +187,12 @@ def main(run, model, config, device, is_sweep=False):
     filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
     norm_biases = [p for n, p in model.named_parameters() if "norm" in n and p.requires_grad]
     param_configs = [
-        dict(params=[model.whiten.bias], lr=bias_lr, weight_decay=wd / bias_lr),
         dict(params=norm_biases, lr=bias_lr, weight_decay=wd / bias_lr),
         dict(params=[model.head.weight], lr=head_lr, weight_decay=wd / head_lr),
     ]
+    if config.whitening:
+        param_configs.append(dict(params=[model.whiten.bias], lr=bias_lr, weight_decay=wd / bias_lr))
+    
     # Use fused optimizer only on CUDA
     use_fused = torch.cuda.is_available()
     optimizer1 = torch.optim.SGD(param_configs, momentum=config.sgd_momentum, nesterov=True, fused=use_fused)
